@@ -68,14 +68,55 @@ impl ThreadArea {
     }
 }
 
+/// Outcome of one [`push_record`] attempt.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Push {
+    /// The record is in the ring and `*head` points past it.
     Done,
+    /// The record does not fit below `limit`. Nothing was written.
     Full,
+    /// The attempt was cut short: the thread was not on `cpu`, or it was preempted, migrated, or
+    /// signalled before the head store. `*head` is unchanged; bytes past it may be partly
+    /// written. Retry.
     Aborted,
 }
 
-/// Attempts to append one record to the ring for `cpu`.
+/// Appends one record to `cpu`'s ring inside one rseq critical section.
+///
+/// The record goes at `base + (*head & mask)`: the payload length as a u64, the `len` payload
+/// bytes, then padding up to a multiple of 8 (padding is not written). `*head` advances by
+/// `(len + 15) & !7`.
+///
+/// How the critical section works:
+///
+/// 1. The asm emits a `struct rseq_cs` descriptor into the `__rseq_cs` section. It holds the
+///    start address of the section, its length, and the address of the abort handler.
+/// 2. Storing the descriptor's address into `rseq->rseq_cs` arms it. While the thread's
+///    instruction pointer is inside the section, any preemption, migration, or signal makes the
+///    kernel resume the thread at the abort handler instead of where it was.
+/// 3. That store is the last instruction before the start. If anything ran in between, a
+///    preemption there would make the kernel clear `rseq_cs` (the instruction pointer is outside
+///    the range) and the section would run unprotected.
+/// 4. The section first checks `rseq->cpu_id == cpu`, so a thread only writes the ring of the CPU
+///    it is on. Any other thread that gets this CPU before our head store aborts us first, so each
+///    ring has exactly one writer at a time and no atomic read-modify-write is needed.
+/// 5. It checks for room, writes the header and payload, then stores the new head. That store is
+///    the commit and the last instruction of the section: before it the consumer sees nothing,
+///    after it the consumer sees the whole record.
+/// 6. The kernel only jumps to an abort handler preceded by the 4-byte signature glibc registered
+///    (`RSEQ_SIG`).
+///
+/// Local labels, the same on both architectures:
+///
+/// | Label | Meaning |
+/// |---|---|
+/// | 20 | the `struct rseq_cs` descriptor (in `__rseq_cs`) |
+/// | 30 | start of the critical section |
+/// | 40 | end of the critical section, right after the head store |
+/// | 50, 51, 52 | aarch64 copy loops (8 bytes at a time, then single bytes, then commit) |
+/// | 60 | abort handler: result 2, `Aborted` |
+/// | 70 | ring full: result 1, `Full` |
+/// | 90 | common exit; success leaves result 0, `Done` |
 ///
 /// # Safety
 ///
@@ -95,60 +136,53 @@ pub unsafe fn push_record(
     len: u64,
 ) -> Push {
     let result: u64;
-    let src_cursor = src;
-    let len_cursor = len;
 
     // SAFETY: the caller provides the memory and per-CPU writer guarantees documented above.
     unsafe {
+        // x86_64. `rep movsb` copies rcx bytes from rsi to rdi, so those three registers are fixed
+        // (Rust does not allow names on fixed registers):
+        //   rdi: the head position, then the destination cursor
+        //   rsi: the source cursor, starts at `src`
+        //   rcx: bytes left to copy, starts at `len`
         #[cfg(target_arch = "x86_64")]
         asm!(
+            // Step 1: descriptor = { version 0, flags 0, start, length, abort handler }.
             ".pushsection __rseq_cs, \"aw\"",
             ".balign 32",
             "20:",
             ".long 0, 0",
             ".quad 30f, 40f - 30f, 60f",
             ".popsection",
-            "leaq 20b(%rip), {tmp}",
-            "movq {tmp}, 8({area})",
+            // Steps 2-3: rseq->rseq_cs (offset 8) = &descriptor, immediately before the start.
+            "leaq 20b(%rip), {desc}",
+            "movq {desc}, 8({rseq})",
             "30:",
-            "cmpl {cpu:e}, 4({area})",
+            // Step 4: abort unless rseq->cpu_id (offset 4) is `cpu`.
+            "cmpl {cpu:e}, 4({rseq})",
             "jne 60f",
-            "movq ({head}), {h}",
-            "movq {h}, {dst}",
-            "andq {mask}, {dst}",
-            "addq {base}, {dst}",
-            "movq {len}, {tmp}",
-            "addq $7, {tmp}",
-            "andq $-8, {tmp}",
-            "addq $8, {tmp}",
-            "addq {h}, {tmp}",
-            "cmpq {limit}, {tmp}",
+            // Step 5a: new_head = head + ((len + 15) & !7), the header plus the padded payload.
+            "movq ({head}), %rdi",
+            "leaq 15(%rcx), {new_head}",
+            "andq $-8, {new_head}",
+            "addq %rdi, {new_head}",
+            // Step 5b: full if the record would end past the consumer's tail plus the ring size.
+            "cmpq {limit}, {new_head}",
             "ja 70f",
-            "movq {len}, ({dst})",
-            "addq $8, {dst}",
-            "50:",
-            "cmpq $8, {len}",
-            "jb 51f",
-            "movq ({src}), {h}",
-            "movq {h}, ({dst})",
-            "addq $8, {src}",
-            "addq $8, {dst}",
-            "subq $8, {len}",
-            "jmp 50b",
-            "51:",
-            "testq {len}, {len}",
-            "je 52f",
-            "movb ({src}), {h:l}",
-            "movb {h:l}, ({dst})",
-            "incq {src}",
-            "incq {dst}",
-            "decq {len}",
-            "jmp 51b",
-            "52:",
-            "movq {tmp}, ({head})",
+            // Step 5c: rdi = ring_base + (head & mask), where the record starts. Write the header.
+            "andq {mask}, %rdi",
+            "addq {ring_base}, %rdi",
+            "movq %rcx, (%rdi)",
+            "addq $8, %rdi",
+            // Step 5d: copy the payload. String stores are not reordered with the later head
+            // store (Intel SDM Vol. 3A 8.2.4.1), and the copy is interruptible.
+            "rep movsb",
+            // Step 5e: commit. Publish the new head; last instruction of the section.
+            "movq {new_head}, ({head})",
             "40:",
             "movq $0, {result}",
             "jmp 90f",
+            // Step 6: RSEQ_SIG 0x53053053, written as the tail of a `ud1` instruction so
+            // disassemblers stay in sync. The kernel reads the 4 bytes before label 60.
             ".byte 0x0f, 0xb9, 0x3d",
             ".long 0x53053053",
             "60:",
@@ -157,66 +191,80 @@ pub unsafe fn push_record(
             "70:",
             "movq $1, {result}",
             "90:",
-            area = in(reg) area.ptr,
+            rseq = in(reg) area.ptr,
             cpu = in(reg) cpu,
             head = in(reg) head,
-            base = in(reg) base,
+            ring_base = in(reg) base,
             mask = in(reg) mask,
             limit = in(reg) limit,
-            src = inout(reg) src_cursor => _,
-            len = inout(reg) len_cursor => _,
-            h = out(reg) _,
-            dst = out(reg) _,
-            tmp = out(reg) _,
+            inout("rsi") src => _,
+            inout("rcx") len => _,
+            out("rdi") _,
+            desc = out(reg) _,
+            new_head = out(reg) _,
             result = lateout(reg) result,
             options(att_syntax, nostack),
         );
 
+        // aarch64. There is no `rep movsb`, so the copy is two loops over named cursors:
+        //   src, dst: source and destination cursors
+        //   left: bytes left to copy, starts at `len`
+        //   word: the 8-byte or 1-byte value in flight
         #[cfg(target_arch = "aarch64")]
         asm!(
+            // Step 1: descriptor = { version 0, flags 0, start, length, abort handler }.
             ".pushsection __rseq_cs, \"aw\"",
             ".balign 32",
             "20:",
             ".long 0, 0",
             ".quad 30f, 40f - 30f, 60f",
             ".popsection",
-            "adrp {tmp}, 20b",
-            "add {tmp}, {tmp}, :lo12:20b",
-            "str {tmp}, [{area}, #8]",
+            // Steps 2-3: rseq->rseq_cs (offset 8) = &descriptor, immediately before the start.
+            // adrp + add reaches the descriptor wherever the linker places __rseq_cs.
+            "adrp {desc}, 20b",
+            "add {desc}, {desc}, :lo12:20b",
+            "str {desc}, [{rseq}, #8]",
             "30:",
-            "ldr {h:w}, [{area}, #4]",
-            "cmp {h:w}, {cpu:w}",
+            // Step 4: abort unless rseq->cpu_id (offset 4) is `cpu`.
+            "ldr {cpu_now:w}, [{rseq}, #4]",
+            "cmp {cpu_now:w}, {cpu:w}",
             "b.ne 60f",
-            "ldr {h}, [{head}]",
-            "and {dst}, {h}, {mask}",
-            "add {dst}, {base}, {dst}",
-            "mov {tmp}, {len}",
-            "add {tmp}, {tmp}, #7",
-            "and {tmp}, {tmp}, #-8",
-            "add {tmp}, {tmp}, #8",
-            "add {tmp}, {h}, {tmp}",
-            "cmp {tmp}, {limit}",
+            // Step 5a: new_head = pos + ((len + 15) & !7), the header plus the padded payload.
+            "ldr {pos}, [{head}]",
+            "add {new_head}, {left}, #15",
+            "and {new_head}, {new_head}, #-8",
+            "add {new_head}, {pos}, {new_head}",
+            // Step 5b: full if the record would end past the consumer's tail plus the ring size.
+            "cmp {new_head}, {limit}",
             "b.hi 70f",
-            "str {len}, [{dst}]",
-            "add {dst}, {dst}, #8",
+            // Step 5c: dst = ring_base + (pos & mask), where the record starts. Write the header.
+            "and {dst}, {pos}, {mask}",
+            "add {dst}, {ring_base}, {dst}",
+            "str {left}, [{dst}], #8",
+            // Step 5d: copy the payload, 8 bytes at a time while at least 8 are left...
             "50:",
-            "cmp {len}, #8",
+            "cmp {left}, #8",
             "b.lo 51f",
-            "ldr {h}, [{src}], #8",
-            "str {h}, [{dst}], #8",
-            "sub {len}, {len}, #8",
+            "ldr {word}, [{src}], #8",
+            "str {word}, [{dst}], #8",
+            "sub {left}, {left}, #8",
             "b 50b",
+            // ...then the last 0-7 bytes one at a time, so `src` is never read past `len`.
             "51:",
-            "cbz {len}, 52f",
-            "ldrb {h:w}, [{src}], #1",
-            "strb {h:w}, [{dst}], #1",
-            "sub {len}, {len}, #1",
+            "cbz {left}, 52f",
+            "ldrb {word:w}, [{src}], #1",
+            "strb {word:w}, [{dst}], #1",
+            "sub {left}, {left}, #1",
             "b 51b",
+            // Step 5e: commit. Store-release of the new head orders it after the payload stores;
+            // last instruction of the section.
             "52:",
-            "stlr {tmp}, [{head}]",
+            "stlr {new_head}, [{head}]",
             "40:",
             "mov {result}, #0",
             "b 90f",
+            // Step 6: RSEQ_SIG, the `brk #0x45e0` instruction. The kernel reads the 4 bytes
+            // before label 60.
             ".inst 0xd428bc00",
             "60:",
             "mov {result}, #2",
@@ -224,17 +272,20 @@ pub unsafe fn push_record(
             "70:",
             "mov {result}, #1",
             "90:",
-            area = in(reg) area.ptr,
+            rseq = in(reg) area.ptr,
             cpu = in(reg) cpu,
             head = in(reg) head,
-            base = in(reg) base,
+            ring_base = in(reg) base,
             mask = in(reg) mask,
             limit = in(reg) limit,
-            src = inout(reg) src_cursor => _,
-            len = inout(reg) len_cursor => _,
-            h = out(reg) _,
+            src = inout(reg) src => _,
+            left = inout(reg) len => _,
+            desc = out(reg) _,
+            cpu_now = out(reg) _,
+            pos = out(reg) _,
+            new_head = out(reg) _,
             dst = out(reg) _,
-            tmp = out(reg) _,
+            word = out(reg) _,
             result = lateout(reg) result,
             options(nostack),
         );
@@ -243,8 +294,7 @@ pub unsafe fn push_record(
     match result {
         0 => Push::Done,
         1 => Push::Full,
-        2 => Push::Aborted,
-        _ => unreachable!(),
+        _ => Push::Aborted,
     }
 }
 
