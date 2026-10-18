@@ -131,7 +131,6 @@ pub struct Reader {
     name: CString,
     max_record: usize,
     tails: Vec<u64>,
-    polled: Vec<usize>,
 }
 
 pub struct Record<'a> {
@@ -192,7 +191,6 @@ impl Reader {
             name,
             max_record,
             tails,
-            polled: Vec::new(),
         })
     }
 
@@ -200,10 +198,9 @@ impl Reader {
         self.tails.len()
     }
 
-    /// Polls rings whose current tail appears to contain a committed record.
-    /// This is only a hint; `read` performs the Acquire load required before consuming a record.
-    pub fn poll(&mut self) -> &[usize] {
-        self.polled.clear();
+    /// Appends to `out` every ring whose current tail appears to hold a committed record. This
+    /// is only a hint: `read` performs the Acquire load required before consuming a record.
+    pub fn poll(&self, out: &mut Vec<usize>) {
         let mask = self.map.ring_size as u64 - 1;
         for ring in 0..self.nr_rings() {
             let tail = self.tails[ring];
@@ -217,10 +214,9 @@ impl Reader {
                     .load(Relaxed)
             };
             if tag == tag_for(tail) {
-                self.polled.push(ring);
+                out.push(ring);
             }
         }
-        &self.polled
     }
 
     /// Visits committed records in `ring`. Stops before the first record for which `f` returns

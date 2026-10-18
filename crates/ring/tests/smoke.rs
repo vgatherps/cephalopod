@@ -17,10 +17,13 @@ fn push_and_read_back() {
     for (seq, r) in records.iter().enumerate() {
         writer.try_push(r, 11, seq as u64).unwrap();
     }
-    assert!(!reader.poll().is_empty());
-    // A Linux thread can migrate between pushes, so order holds within each ring only.
+    // Sweep the way a consumer does: poll, then read exactly the rings it named. A Linux thread
+    // can migrate between pushes, so order holds within each ring only.
+    let mut ready = Vec::new();
+    reader.poll(&mut ready);
+    assert!(!ready.is_empty());
     let mut seen = Vec::new();
-    for ring in 0..reader.nr_rings() {
+    for &ring in &ready {
         let mut in_ring = Vec::new();
         reader.read(ring, |r| {
             in_ring.push((r.seq, r.stream, r.payload.to_vec()));
