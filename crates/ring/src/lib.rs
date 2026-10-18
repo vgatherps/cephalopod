@@ -130,7 +130,7 @@ impl Reader {
             "max_record {max_record} + 8 exceeds ring_size {ring_size}"
         );
         let nr_rings = possible_cpus()?;
-        let name = shm_name(prefix)?;
+        let name = shm_name(prefix);
         // SAFETY: `name` is NUL-terminated. A missing object is not an error here.
         unsafe { libc::shm_unlink(name.as_ptr()) };
         let fd = shm_open(&name, libc::O_CREAT | libc::O_EXCL)?;
@@ -141,7 +141,8 @@ impl Reader {
         }
         let map = Map::new(&fd, nr_rings, ring_size)?;
         let header = map.meta.cast::<Header>();
-        // SAFETY: the header is in the mapping; writers read the fields only after seeing `magic`.
+        // SAFETY: the header is in the mapping; writers read the other fields only after seeing
+        // `magic`.
         unsafe {
             (*header).nr_rings = nr_rings as u64;
             (*header).ring_size = ring_size as u64;
@@ -221,11 +222,11 @@ impl Writer {
                 "glibc did not register rseq",
             ));
         }
-        let fd = shm_open(&shm_name(prefix)?, 0)?;
+        let fd = shm_open(&shm_name(prefix), 0)?;
         let page = page_size();
         // SAFETY: no address hint. The header is read and the temporary mapping removed below.
-        let (magic, nr_rings, ring_size, max_record) = unsafe {
-            let header = mmap(
+        let header = unsafe {
+            mmap(
                 ptr::null_mut(),
                 page,
                 libc::PROT_READ,
@@ -233,9 +234,23 @@ impl Writer {
                 fd.as_raw_fd(),
                 0,
             )?
-            .cast::<Header>();
+            .cast::<Header>()
+        };
+        // SAFETY: the header is in the temporary mapping.
+        let magic = unsafe { (*header).magic.load(Acquire) };
+        if magic != MAGIC {
+            // SAFETY: this is the temporary mapping made above.
+            unsafe {
+                libc::munmap(header.cast(), page);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "shm object has no ring magic",
+            ));
+        }
+        // SAFETY: seeing `magic` with Acquire synchronizes with `create` publishing the layout.
+        let (nr_rings, ring_size, max_record) = unsafe {
             let fields = (
-                (*header).magic.load(Acquire),
                 (*header).nr_rings as usize,
                 (*header).ring_size as usize,
                 (*header).max_record as usize,
@@ -243,12 +258,6 @@ impl Writer {
             libc::munmap(header.cast(), page);
             fields
         };
-        if magic != MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "shm object has no ring magic",
-            ));
-        }
         Ok(Writer {
             map: Map::new(&fd, nr_rings, ring_size)?,
             max_record,
@@ -260,14 +269,15 @@ impl Writer {
             return Err(PushError::TooLarge);
         }
         let ring_size = self.map.ring_size as u64;
+        let area = ThreadArea::current().expect("attach checked that rseq is registered");
         loop {
-            let area = ThreadArea::current().expect("attach checked that rseq is registered");
             let cpu = area.cpu_id_start();
             let (base, head, tail) = self.map.ring(cpu as usize);
             let limit = tail.load(Acquire) + ring_size;
             // SAFETY: `head` is 128-aligned and written only by push_record on `cpu` (it aborts
-            // when the thread is elsewhere). `base` is ring `cpu` mapped twice, and a record of at
-            // most max_record + 8 <= ring_size bytes starting below ring_size stays inside it.
+            // when the thread is elsewhere). `base` is ring `cpu` mapped twice, and a record takes
+            // 8 + round_up(len, 8) bytes, at most ring_size: ring_size - 8 is a multiple of 8 and
+            // max_record + 8 <= ring_size.
             let push = unsafe {
                 push_record(
                     area,
@@ -308,8 +318,8 @@ fn possible_cpus() -> io::Result<usize> {
     Ok(max + 1)
 }
 
-fn shm_name(prefix: &str) -> io::Result<CString> {
-    Ok(CString::new(format!("/{prefix}"))?)
+fn shm_name(prefix: &str) -> CString {
+    CString::new(format!("/{prefix}")).expect("shm prefix contains NUL")
 }
 
 fn shm_open(name: &CString, flags: c_int) -> io::Result<OwnedFd> {
