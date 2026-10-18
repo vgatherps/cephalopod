@@ -3,6 +3,14 @@
 version = 4
 
 [[package]]
+name = "ceph-ring"
+version = "0.1.0"
+dependencies = [
+ "ceph-rseq",
+ "libc",
+]
+
+[[package]]
 name = "ceph-rseq"
 version = "0.1.0"
 dependencies = [

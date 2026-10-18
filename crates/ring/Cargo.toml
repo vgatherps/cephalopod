@@ -1,0 +1,11 @@
+[package]
+name = "ceph-ring"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "ceph_ring"
+
+[dependencies]
+ceph-rseq.workspace = true
+libc.workspace = true
