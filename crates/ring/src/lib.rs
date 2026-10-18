@@ -3,9 +3,10 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::ptr;
 use std::slice;
-use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::{Acquire, Release};
+use std::sync::atomic::{AtomicU32, AtomicU64};
 
+#[cfg(target_os = "linux")]
 use ceph_rseq::{Push, ThreadArea, push_record};
 
 const MAGIC: u64 = u64::from_le_bytes(*b"cephring");
@@ -20,7 +21,12 @@ struct Header {
 }
 
 #[repr(C, align(128))]
-struct Line(AtomicU64);
+struct Line {
+    value: AtomicU64,
+    /// Off Linux, the push spinlock of a head line. Kept on Linux so the layout matches.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    lock: AtomicU32,
+}
 
 pub struct Config {
     pub ring_size: usize,
@@ -90,8 +96,16 @@ impl Map {
     fn ring(&self, i: usize) -> (*mut u8, &AtomicU64, &AtomicU64) {
         let base = self.rings[i];
         // SAFETY: `nr_rings` heads then `nr_rings` tails start at LINES_OFFSET inside `meta`.
-        let line = |j: usize| unsafe { &(*self.meta.add(LINES_OFFSET).cast::<Line>().add(j)).0 };
+        let line =
+            |j: usize| unsafe { &(*self.meta.add(LINES_OFFSET).cast::<Line>().add(j)).value };
         (base, line(i), line(self.rings.len() + i))
+    }
+
+    /// Ring 0's push spinlock, in its head line.
+    #[cfg(not(target_os = "linux"))]
+    fn lock(&self) -> &AtomicU32 {
+        // SAFETY: ring 0's head is the first line at LINES_OFFSET inside `meta`.
+        unsafe { &(*self.meta.add(LINES_OFFSET).cast::<Line>()).lock }
     }
 }
 
@@ -129,7 +143,10 @@ impl Reader {
             max_record.checked_add(8).is_some_and(|n| n <= ring_size),
             "max_record {max_record} + 8 exceeds ring_size {ring_size}"
         );
+        #[cfg(target_os = "linux")]
         let nr_rings = possible_cpus()?;
+        #[cfg(not(target_os = "linux"))]
+        let nr_rings = 1;
         let name = shm_name(prefix);
         // SAFETY: `name` is NUL-terminated. A missing object is not an error here.
         unsafe { libc::shm_unlink(name.as_ptr()) };
@@ -210,12 +227,14 @@ pub struct Writer {
 }
 
 // SAFETY: the mappings are process-wide. `try_push` writes a ring only inside `push_record` on the
-// calling thread's current CPU, and heads and tails are atomics.
+// calling thread's current CPU (off Linux, only under the ring's spinlock), and heads and tails are
+// atomics.
 unsafe impl Send for Writer {}
 unsafe impl Sync for Writer {}
 
 impl Writer {
     pub fn attach(prefix: &str) -> io::Result<Writer> {
+        #[cfg(target_os = "linux")]
         if !ceph_rseq::registered() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -268,6 +287,11 @@ impl Writer {
         if record.len() > self.max_record {
             return Err(PushError::TooLarge);
         }
+        self.push(record)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn push(&self, record: &[u8]) -> Result<(), PushError> {
         let ring_size = self.map.ring_size as u64;
         let area = ThreadArea::current().expect("attach checked that rseq is registered");
         loop {
@@ -297,6 +321,45 @@ impl Writer {
             }
         }
     }
+
+    #[cfg(not(target_os = "linux"))]
+    fn push(&self, record: &[u8]) -> Result<(), PushError> {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        static WARN: std::sync::Once = std::sync::Once::new();
+        WARN.call_once(|| {
+            eprintln!(
+                "WARNING: ceph-ring: rseq is unavailable on this OS, so every push takes a \
+                 spinlock on a single ring. Development only, NOT for production."
+            )
+        });
+        let ring_size = self.map.ring_size as u64;
+        let (base, head, tail) = self.map.ring(0);
+        let lock = self.map.lock();
+        while lock.compare_exchange(0, 1, Acquire, Relaxed).is_err() {
+            std::hint::spin_loop();
+        }
+        // The lock's Acquire orders this after the previous holder's head store.
+        let at = head.load(Relaxed);
+        let len = record.len() as u64;
+        let end = at + 8 + len.next_multiple_of(8);
+        let result = if end > tail.load(Acquire) + ring_size {
+            Err(PushError::Full)
+        } else {
+            // SAFETY: `at` is 8-aligned and `base` is ring 0 mapped twice, so the 8 + len bytes
+            // (len <= max_record <= ring_size - 8) are contiguous. The reader is done with them
+            // (`end` <= tail + ring_size) and other writers wait on the lock.
+            unsafe {
+                let start = base.add((at & (ring_size - 1)) as usize);
+                start.cast::<u64>().write(len);
+                ptr::copy_nonoverlapping(record.as_ptr(), start.add(8), record.len());
+            }
+            head.store(end, Release);
+            Ok(())
+        };
+        lock.store(0, Release);
+        result
+    }
 }
 
 fn page_size() -> usize {
@@ -309,6 +372,7 @@ fn meta_bytes(nr_rings: usize) -> usize {
 }
 
 /// Max id in the possible-CPU list, plus one.
+#[cfg(target_os = "linux")]
 fn possible_cpus() -> io::Result<usize> {
     let list = std::fs::read_to_string("/sys/devices/system/cpu/possible")?;
     let mut max = 0;

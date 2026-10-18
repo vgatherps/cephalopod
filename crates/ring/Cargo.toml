@@ -7,5 +7,7 @@ edition.workspace = true
 name = "ceph_ring"
 
 [dependencies]
-ceph-rseq.workspace = true
 libc.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ceph-rseq.workspace = true

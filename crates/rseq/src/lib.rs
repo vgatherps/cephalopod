@@ -1,5 +1,5 @@
-#[cfg(not(target_os = "linux"))]
-compile_error!("ceph-rseq requires Linux");
+#![cfg(target_os = "linux")]
+
 #[cfg(not(target_env = "gnu"))]
 compile_error!("ceph-rseq requires the GNU libc environment");
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
