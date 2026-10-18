@@ -181,8 +181,11 @@ fn old_uid_is_discarded() {
     control.send(Control::Close { slot: 1, uid: 7 }).unwrap();
     control.send(Control::Open { slot: 1, uid: 8 }).unwrap();
     control.send(Control::Close { slot: 1, uid: 7 }).unwrap();
-    writer.try_push(b"old one", old_stream, 1).unwrap();
+    // Control messages are drained at a sweep boundary or when a front record's uid does not
+    // match its slot. The new stream's record goes first so that rule fires; the old stream's
+    // record behind it must then be discarded.
     writer.try_push(b"new zero", new_stream, 0).unwrap();
+    writer.try_push(b"old one", old_stream, 1).unwrap();
 
     assert_eq!(
         next_message(&mut fifo),
