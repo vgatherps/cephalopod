@@ -1,14 +1,38 @@
 use std::sync::mpsc::{Receiver, Sender};
 
 use ceph_proto::{Control, Kick, slot, uid};
-use ceph_ring::{Reader, Record};
+use ceph_ring::Reader;
 
 const BATCH: usize = 64;
 
 pub struct Message<'a> {
-    pub stream: u64,
-    pub seq: u64,
-    pub payload: &'a [u8],
+    stream: u64,
+    seq: u64,
+    payload: *const [u8],
+    ring: usize,
+    reader: &'a mut Reader,
+}
+
+impl Message<'_> {
+    pub fn stream(&self) -> u64 {
+        self.stream
+    }
+
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    pub fn payload(&self) -> &[u8] {
+        // SAFETY: the slice points into the ring mapping, which stays valid while this message
+        // holds the mutable reader borrow and prevents publishing its tail.
+        unsafe { &*self.payload }
+    }
+}
+
+impl Drop for Message<'_> {
+    fn drop(&mut self) {
+        self.reader.advance(self.ring);
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -52,9 +76,10 @@ impl Fifo {
         }
     }
 
-    /// Returns the next deliverable message, or `None` if none is available now. The returned
-    /// payload remains valid until the next call to `next`. Up to 64 consecutive messages are
-    /// delivered from one ring before advancing to the next ring.
+    /// Returns the next deliverable message, or `None` if none is available now. The message
+    /// borrows the `Fifo`; dropping it consumes the record, and `publish` happens at the next
+    /// sweep boundary. Up to 64 consecutive records are passed on one ring before advancing to
+    /// the next ring.
     pub fn next(&mut self) -> Option<Message<'_>> {
         loop {
             if self.pos == self.ready.len() {
@@ -73,21 +98,24 @@ impl Fifo {
             };
             let index = slot(header.stream) as usize;
             if index >= self.slots.len() {
-                drop(self.reader.take(ring));
+                self.reader.advance(ring);
+                self.count_record();
                 continue;
             }
 
             if uid(header.stream) != self.slots[index].uid {
                 self.drain_control();
                 if uid(header.stream) != self.slots[index].uid {
-                    drop(self.reader.take(ring));
+                    self.reader.advance(ring);
+                    self.count_record();
                     continue;
                 }
             }
 
             let state = self.slots[index];
             if !state.live || header.seq < state.expected {
-                drop(self.reader.take(ring));
+                self.reader.advance(ring);
+                self.count_record();
                 continue;
             }
             if header.seq > state.expected {
@@ -99,21 +127,30 @@ impl Fifo {
 
             self.slots[index].expected += 1;
             self.delivered = true;
-            self.batch += 1;
-            if self.batch == BATCH {
-                self.pos += 1;
-                self.batch = 0;
-            }
-            let Record {
-                stream,
-                seq,
-                payload,
-            } = self.reader.take(ring);
+            self.count_record();
+            let (stream, seq, payload) = {
+                let record = self.reader.view(ring);
+                (
+                    record.stream,
+                    record.seq,
+                    std::ptr::slice_from_raw_parts(record.payload.as_ptr(), record.payload.len()),
+                )
+            };
             return Some(Message {
                 stream,
                 seq,
                 payload,
+                ring,
+                reader: &mut self.reader,
             });
+        }
+    }
+
+    fn count_record(&mut self) {
+        self.batch += 1;
+        if self.batch == BATCH {
+            self.pos += 1;
+            self.batch = 0;
         }
     }
 
@@ -144,16 +181,19 @@ impl Fifo {
         while let Ok(message) = self.control.try_recv() {
             match message {
                 Control::Open { slot, uid } => {
-                    self.slots[slot as usize] = Slot {
-                        uid,
-                        expected: 0,
-                        live: true,
-                    };
+                    if let Some(state) = self.slots.get_mut(slot as usize) {
+                        *state = Slot {
+                            uid,
+                            expected: 0,
+                            live: true,
+                        };
+                    }
                 }
                 Control::Close { slot, uid } => {
-                    let state = &mut self.slots[slot as usize];
-                    if state.uid == uid {
-                        state.live = false;
+                    if let Some(state) = self.slots.get_mut(slot as usize) {
+                        if state.uid == uid {
+                            state.live = false;
+                        }
                     }
                 }
             }

@@ -59,7 +59,7 @@ fn setup(test: &str) -> (Writer, Fifo, Sender<Control>, Receiver<Kick>) {
 
 fn next_message(fifo: &mut Fifo) -> Option<(u64, u64, Vec<u8>)> {
     fifo.next()
-        .map(|message| (message.stream, message.seq, message.payload.to_vec()))
+        .map(|message| (message.stream(), message.seq(), message.payload().to_vec()))
 }
 
 #[test]
@@ -130,10 +130,10 @@ fn held_message_blocks_publish() {
         }
     }
 
-    let message = fifo.next().unwrap();
+    let m = fifo.next().unwrap();
     assert_eq!(writer.try_push(&payload, stream, seq), Err(PushError::Full));
-    assert_eq!(message.payload, payload);
-    drop(message);
+    assert_eq!(m.payload(), payload);
+    drop(m);
 
     while fifo.next().is_some() {}
     assert_eq!(writer.try_push(&payload, stream, seq), Ok(()));
