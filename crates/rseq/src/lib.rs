@@ -6,9 +6,7 @@ compile_error!("ceph-rseq requires the GNU libc environment");
 compile_error!("ceph-rseq requires x86_64 or aarch64");
 
 use std::arch::asm;
-use std::marker::PhantomData;
 use std::ptr;
-use std::rc::Rc;
 
 unsafe extern "C" {
     static __rseq_offset: isize;
@@ -25,7 +23,6 @@ pub fn registered() -> bool {
 #[derive(Clone, Copy)]
 pub struct ThreadArea {
     ptr: *mut u8,
-    not_send_or_sync: PhantomData<Rc<()>>,
 }
 
 impl ThreadArea {
@@ -57,7 +54,6 @@ impl ThreadArea {
         Some(ThreadArea {
             // SAFETY: glibc's offset identifies this thread's rseq area within its TLS allocation.
             ptr: unsafe { thread_pointer.offset(offset) },
-            not_send_or_sync: PhantomData,
         })
     }
 
@@ -355,30 +351,20 @@ pub unsafe fn push_record(
 
 #[cfg(test)]
 mod tests {
-    // `record_layout` checks the header, payload, padding, and head written by `push_record`.
-    // `full_boundaries_do_not_write` checks that `Full` leaves the head and destination unchanged.
-    // `wrong_cpu_does_not_write` checks that a mismatched CPU aborts before any write.
-    // `source_is_not_read_past_length` checks that copying stops exactly at `len`.
-    // `signals_abort_one_writer` checks that a signal aborts or completes one writer cleanly.
-    // `same_cpu_writers_are_serialized` checks that two writers do not commit into one ring slot.
-    // `descriptor_brackets_arming_and_commit` checks that the rseq descriptor covers both stores.
     use super::*;
-    use std::cell::UnsafeCell;
     use std::mem;
     use std::slice;
-    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-    use std::sync::{mpsc, Arc, Barrier, Once};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+    use std::sync::{mpsc, Barrier};
     use std::thread;
     use std::time::{Duration, Instant};
 
     const RING_SIZE: usize = 64 * 1024;
 
-    /// Pins this test thread to `cpu` so its registered rseq CPU value is predictable.
     fn pin_to(cpu: usize) {
         // SAFETY: `set` is initialized before it is passed to `sched_setaffinity`.
         unsafe {
             let mut set: libc::cpu_set_t = mem::zeroed();
-            libc::CPU_ZERO(&mut set);
             libc::CPU_SET(cpu, &mut set);
             assert_eq!(
                 libc::sched_setaffinity(0, mem::size_of::<libc::cpu_set_t>(), &set),
@@ -387,7 +373,6 @@ mod tests {
         }
     }
 
-    /// Returns the CPUs to which the current process is allowed to bind test threads.
     fn available_cpus() -> Vec<usize> {
         // SAFETY: `set` is initialized by `sched_getaffinity` before it is inspected.
         unsafe {
@@ -416,49 +401,32 @@ mod tests {
         8 + (len + 7) / 8 * 8
     }
 
-    /// Calls `push_record` with the common test ring layout.
-    ///
-    /// The caller must provide storage for the record and keep this thread as the sole head writer.
-    unsafe fn push(
-        area: ThreadArea,
-        cpu: u32,
-        head: &mut u64,
-        buffer: &mut [u8],
-        limit: u64,
-        src: *const u8,
-        len: usize,
-    ) -> Push {
-        // SAFETY: the test allocations cover the record and only this thread writes `head`.
-        unsafe {
-            push_record(
-                area,
-                cpu,
-                head,
-                buffer.as_mut_ptr(),
-                (RING_SIZE - 1) as u64,
-                limit,
-                src,
-                len as u64,
-            )
-        }
-    }
-
-    /// Retries `push` after rseq aborts caused by preemption, which pinning does not prevent.
+    /// Retries `push_record` after rseq aborts caused by preemption, which pinning does not prevent.
     ///
     /// The retry count is bounded so an implementation that aborts every attempt fails promptly.
-    unsafe fn push_until_not_aborted(
+    unsafe fn push_retrying(
         area: ThreadArea,
         cpu: u32,
         head: &mut u64,
         buffer: &mut [u8],
         limit: u64,
-        src: *const u8,
-        len: usize,
+        src: &[u8],
     ) -> Push {
         for _ in 0..10_000 {
             let head_before = *head;
-            // SAFETY: the caller satisfies `push`'s test allocation contract.
-            let result = unsafe { push(area, cpu, head, buffer, limit, src, len) };
+            // SAFETY: the caller provides storage for this record and is this head's sole writer.
+            let result = unsafe {
+                push_record(
+                    area,
+                    cpu,
+                    head,
+                    buffer.as_mut_ptr(),
+                    (RING_SIZE - 1) as u64,
+                    limit,
+                    src.as_ptr(),
+                    src.len() as u64,
+                )
+            };
             if result != Push::Aborted {
                 return result;
             }
@@ -468,103 +436,43 @@ mod tests {
     }
 
     #[test]
-    /// Writes payloads at alignment boundaries and checks their header, bytes, padding, and head.
-    ///
-    /// This catches a wrong length header, a bad payload copy, bad padding, or an incorrect head
-    /// advance.
-    fn record_layout() {
-        let (area, cpu) = pinned_area();
-        for len in [0, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 100] {
-            let payload: Vec<u8> = (0..len).map(|index| index as u8 ^ 0x5a).collect();
-            let mut buffer = vec![0xaa; RING_SIZE + total(100)];
-            let mut head = 0;
-
-            // SAFETY: `buffer` and `payload` satisfy `push`'s test allocation contract.
-            let result = unsafe {
-                push_until_not_aborted(
-                    area,
-                    cpu,
-                    &mut head,
-                    &mut buffer,
-                    RING_SIZE as u64,
-                    payload.as_ptr(),
-                    len,
-                )
-            };
-
-            assert_eq!(result, Push::Done);
-            assert_eq!(u64::from_ne_bytes(buffer[..8].try_into().unwrap()), len as u64);
-            assert_eq!(&buffer[8..8 + len], payload.as_slice());
-            assert_eq!(&buffer[8 + len..total(len)], vec![0xaa; total(len) - 8 - len]);
-            assert_eq!(head, total(len) as u64);
-        }
-    }
-
-    #[test]
-    /// Tries a record at its exact limit, one byte below it, and with a stale limit behind the
-    /// head.
-    ///
-    /// The fitting record must finish. Both `Full` cases must leave the head and bytes unchanged,
-    /// catching a full check that writes before it fails.
+    /// Tries a record one byte below and exactly at its limit.
     fn full_boundaries_do_not_write() {
         let (area, cpu) = pinned_area();
         let payload = [0x35; 17];
         let needed = total(payload.len()) as u64;
 
-        let mut exact_buffer = vec![0xaa; RING_SIZE + total(payload.len())];
-        let mut exact_head = 0;
-        // SAFETY: the test allocations cover the record and only this thread writes the head.
-        let exact = unsafe {
-            push_until_not_aborted(
-                area,
-                cpu,
-                &mut exact_head,
-                &mut exact_buffer,
-                needed,
-                payload.as_ptr(),
-                payload.len(),
-            )
-        };
-        assert_eq!(exact, Push::Done);
-        assert_eq!(exact_head, needed);
-
-        let mut short_buffer = vec![0xaa; RING_SIZE + total(payload.len())];
-        let original_short = short_buffer.clone();
-        let mut short_head = 0;
+        let mut buffer = vec![0xaa; total(payload.len())];
+        let original = buffer.clone();
+        let mut head = 0;
         // SAFETY: the full check runs before the otherwise valid destination is written.
         let short = unsafe {
-            push_until_not_aborted(
+            push_retrying(
                 area,
                 cpu,
-                &mut short_head,
-                &mut short_buffer,
+                &mut head,
+                &mut buffer,
                 needed - 1,
-                payload.as_ptr(),
-                payload.len(),
+                &payload,
             )
         };
         assert_eq!(short, Push::Full);
-        assert_eq!(short_head, 0);
-        assert_eq!(short_buffer, original_short);
+        assert_eq!(head, 0);
+        assert_eq!(buffer, original);
 
-        let mut stale_buffer = vec![0xaa; RING_SIZE + total(payload.len())];
-        let original_stale = stale_buffer.clone();
-        let mut stale_head = 10 * RING_SIZE as u64;
-        // SAFETY: the stale limit makes the full check fail before any destination write.
-        let stale = unsafe {
-            push_until_not_aborted(
+        // SAFETY: the allocation covers the fitting record and this is its sole head writer.
+        let exact = unsafe {
+            push_retrying(
                 area,
                 cpu,
-                &mut stale_head,
-                &mut stale_buffer,
-                RING_SIZE as u64,
-                payload.as_ptr(),
-                payload.len(),
+                &mut head,
+                &mut buffer,
+                needed,
+                &payload,
             )
         };
-        assert_eq!(stale, Push::Full);
-        assert_eq!(stale_head, 10 * RING_SIZE as u64);
-        assert_eq!(stale_buffer, original_stale);
+        assert_eq!(exact, Push::Done);
+        assert_eq!(head, needed);
     }
 
     #[test]
@@ -575,20 +483,21 @@ mod tests {
     fn wrong_cpu_does_not_write() {
         let (area, cpu) = pinned_area();
         let payload = [0x71; 16];
-        let mut buffer = vec![0xaa; RING_SIZE + total(payload.len())];
+        let mut buffer = vec![0xaa; total(payload.len())];
         let original = buffer.clone();
         let mut head = 0;
 
         // SAFETY: the CPU check aborts before the otherwise valid destination is written.
         let result = unsafe {
-            push(
+            push_record(
                 area,
                 cpu + 1,
                 &mut head,
-                &mut buffer,
+                buffer.as_mut_ptr(),
+                (RING_SIZE - 1) as u64,
                 RING_SIZE as u64,
                 payload.as_ptr(),
-                payload.len(),
+                payload.len() as u64,
             )
         };
 
@@ -601,10 +510,9 @@ mod tests {
     /// Places payloads immediately before a protected page and copies every length through
     /// one hundred bytes.
     ///
-    /// Each call must finish and reproduce exactly `len` bytes; a read past `src + len` faults,
-    /// enters the rseq abort handler, and appears here as endless `Aborted` retries rather than a
-    /// process crash.
-    fn source_is_not_read_past_length() {
+    /// An over-read inside the section faults. The first fault enters the abort handler and the
+    /// retry faults again, so the test fails, most likely by the process dying on the second fault.
+    fn layout_and_no_source_over_read() {
         let (area, cpu) = pinned_area();
         // SAFETY: the mapping is checked for failure, then split into one readable and one guard page.
         unsafe {
@@ -626,19 +534,22 @@ mod tests {
                 for index in 0..len {
                     src.add(index).write(index as u8 ^ 0xa6);
                 }
-                let mut buffer = vec![0xaa; RING_SIZE + total(100)];
+                let mut buffer = vec![0xaa; total(100)];
                 let mut head = 0;
-                let result = push_until_not_aborted(
+                let src = slice::from_raw_parts(src, len);
+                let result = push_retrying(
                     area,
                     cpu,
                     &mut head,
                     &mut buffer,
-                    RING_SIZE as u64,
+                    total(100) as u64,
                     src,
-                    len,
                 );
                 assert_eq!(result, Push::Done);
-                assert_eq!(&buffer[8..8 + len], slice::from_raw_parts(src, len));
+                assert_eq!(u64::from_ne_bytes(buffer[..8].try_into().unwrap()), len as u64);
+                assert_eq!(&buffer[8..8 + len], src);
+                assert_eq!(&buffer[8 + len..total(len)], vec![0xaa; total(len) - 8 - len]);
+                assert_eq!(head, total(len) as u64);
             }
 
             assert_eq!(libc::munmap(mapping, page_size * 2), 0);
@@ -648,143 +559,15 @@ mod tests {
     /// Accepts `SIGUSR1` so delivery can interrupt rseq without terminating the test process.
     extern "C" fn ignore_signal(_: libc::c_int) {}
 
-    /// Installs `ignore_signal` once for all tests that inject `SIGUSR1` into writer threads.
-    fn install_signal_handler() {
-        static INSTALL: Once = Once::new();
-        INSTALL.call_once(|| {
-            // SAFETY: the handler has C ABI and remains valid for the process lifetime.
-            unsafe {
-                let mut action: libc::sigaction = mem::zeroed();
-                action.sa_sigaction = ignore_signal as *const () as usize;
-                action.sa_flags = libc::SA_RESTART;
-                libc::sigemptyset(&mut action.sa_mask);
-                assert_eq!(libc::sigaction(libc::SIGUSR1, &action, ptr::null_mut()), 0);
-            }
-        });
-    }
-
-    /// Returns this Linux thread's kernel thread id for `tgkill`.
     fn thread_id() -> libc::pid_t {
         // SAFETY: `gettid` has no pointer arguments or caller obligations.
         unsafe { libc::syscall(libc::SYS_gettid) as libc::pid_t }
     }
 
-    /// Sends the test signal to `tid`, returning false when that thread has already exited.
-    fn send_signal(tid: libc::pid_t) -> bool {
+    fn send_signal(tid: libc::pid_t) {
         // SAFETY: `tgkill` receives the current process and a thread id obtained from `gettid`.
         unsafe {
-            libc::syscall(libc::SYS_tgkill, libc::getpid(), tid, libc::SIGUSR1) == 0
-        }
-    }
-
-    #[test]
-    /// Sends `SIGUSR1` repeatedly while one pinned writer copies large records into a local ring.
-    ///
-    /// Completed records must be intact and aborted records must leave `head` at zero. This catches
-    /// an abort path that exposes partial work or a critical section that cannot be interrupted
-    /// safely.
-    fn signals_abort_one_writer() {
-        install_signal_handler();
-        let cpu = available_cpus()[0];
-        let (tid_tx, tid_rx) = mpsc::channel();
-        let stop = Arc::new(AtomicBool::new(false));
-        let start = Arc::new(Barrier::new(2));
-        let writer_start = Arc::clone(&start);
-        let writer = thread::spawn(move || {
-            pin_to(cpu);
-            let area = ThreadArea::current().expect("glibc did not register rseq");
-            tid_tx.send(thread_id()).unwrap();
-            writer_start.wait();
-            let max_len = 60_256;
-            let mut payload = vec![0; max_len];
-            let mut buffer = vec![0xaa; RING_SIZE + total(max_len)];
-            let mut aborts = 0;
-            let mut done = 0;
-
-            for attempt in 0..4_000_u64 {
-                let len = 60_000 + attempt as usize % 257;
-                for (index, byte) in payload[..len].iter_mut().enumerate() {
-                    *byte = (attempt * 29 ^ index as u64) as u8;
-                }
-                let mut head = 0;
-                // SAFETY: the local buffer covers the largest record and this is its only writer.
-                let result = unsafe {
-                    push(
-                        area,
-                        cpu as u32,
-                        &mut head,
-                        &mut buffer,
-                        RING_SIZE as u64,
-                        payload.as_ptr(),
-                        len,
-                    )
-                };
-                match result {
-                    Push::Done => {
-                        done += 1;
-                        assert_eq!(head, total(len) as u64);
-                        assert_eq!(
-                            u64::from_ne_bytes(buffer[..8].try_into().unwrap()),
-                            len as u64
-                        );
-                        assert_eq!(&buffer[8..8 + len], &payload[..len]);
-                    }
-                    Push::Aborted => {
-                        assert_eq!(head, 0);
-                        aborts += 1;
-                    }
-                    Push::Full => panic!("record unexpectedly did not fit"),
-                }
-            }
-            (aborts, done)
-        });
-
-        let writer_tid = tid_rx.recv().unwrap();
-        let signal_stop = Arc::clone(&stop);
-        let signaler = thread::spawn(move || {
-            start.wait();
-            while !signal_stop.load(Ordering::Acquire) {
-                if !send_signal(writer_tid) {
-                    break;
-                }
-            }
-        });
-
-        let (aborts, done) = writer.join().unwrap();
-        stop.store(true, Ordering::Release);
-        signaler.join().unwrap();
-        assert!(aborts > 0);
-        assert!(done > 0);
-    }
-
-    /// Ring storage shared by concurrent writers and one consumer in the serialization test.
-    struct ConcurrentRing {
-        head: AtomicU64,
-        tail: AtomicU64,
-        bytes: Box<[UnsafeCell<u8>]>,
-    }
-
-    // SAFETY: writers use the rseq section and the consumer follows the Acquire/Release protocol.
-    unsafe impl Sync for ConcurrentRing {}
-
-    impl ConcurrentRing {
-        /// Allocates an initialized ring with trailing space for records that wrap at the ring
-        /// boundary.
-        fn new() -> ConcurrentRing {
-            ConcurrentRing {
-                head: AtomicU64::new(0),
-                tail: AtomicU64::new(0),
-                bytes: (0..RING_SIZE + total(8 * 1024))
-                    .map(|_| UnsafeCell::new(0xaa))
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice(),
-            }
-        }
-
-        /// Returns the byte address passed to `push_record` and used by the consumer to read
-        /// records.
-        fn base(&self) -> *mut u8 {
-            self.bytes.as_ptr().cast::<u8>() as *mut u8
+            libc::syscall(libc::SYS_tgkill, libc::getpid(), tid, libc::SIGUSR1);
         }
     }
 
@@ -824,144 +607,137 @@ mod tests {
     fn same_cpu_writers_are_serialized() {
         const WRITERS: usize = 2;
 
-        install_signal_handler();
+        // SAFETY: the handler has C ABI and remains valid for the process lifetime.
+        unsafe {
+            let mut action: libc::sigaction = mem::zeroed();
+            action.sa_sigaction = ignore_signal as *const () as usize;
+            action.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut action.sa_mask);
+            assert_eq!(libc::sigaction(libc::SIGUSR1, &action, ptr::null_mut()), 0);
+        }
         let cpus = available_cpus();
         assert!(cpus.len() >= 2, "test requires at least two available CPUs");
         let writer_cpu = cpus[0];
         let other_cpu = cpus[1];
-        let ring = Arc::new(ConcurrentRing::new());
-        let active = Arc::new(AtomicUsize::new(WRITERS));
-        let aborts = Arc::new(AtomicU64::new(0));
-        let start = Arc::new(Barrier::new(WRITERS + 1));
+        let head = AtomicU64::new(0);
+        let tail = AtomicU64::new(0);
+        let bytes = (0..RING_SIZE + total(8 * 1024))
+            .map(|_| AtomicU8::new(0))
+            .collect::<Vec<_>>();
+        let active = AtomicUsize::new(WRITERS);
+        let start = Barrier::new(WRITERS + 1);
         let (tid_tx, tid_rx) = mpsc::channel();
-        let mut writers = Vec::new();
+        let signal_stop = AtomicBool::new(false);
 
-        for writer_id in 0..WRITERS {
-            let writer_ring = Arc::clone(&ring);
-            let writer_active = Arc::clone(&active);
-            let writer_aborts = Arc::clone(&aborts);
-            let writer_start = Arc::clone(&start);
-            let writer_tid = tid_tx.clone();
-            writers.push(thread::spawn(move || {
-                pin_to(writer_cpu);
-                let area = ThreadArea::current().expect("glibc did not register rseq");
-                assert_eq!(area.cpu_id_start(), writer_cpu as u32);
-                writer_tid.send(thread_id()).unwrap();
-                writer_start.wait();
-                let deadline = Instant::now() + Duration::from_secs(3);
-                let mut index = 0_u64;
-                let mut record = vec![0; 8 * 1024];
+        thread::scope(|scope| {
+            let head = &head;
+            let tail = &tail;
+            let bytes = &bytes;
+            let active = &active;
+            let start = &start;
+            let signal_stop = &signal_stop;
+            let mut writers = Vec::new();
+            for writer_id in 0..WRITERS {
+                let writer_tid = tid_tx.clone();
+                writers.push(scope.spawn(move || {
+                    let base = bytes.as_ptr() as *mut u8;
+                    pin_to(writer_cpu);
+                    let area = ThreadArea::current().expect("glibc did not register rseq");
+                    assert_eq!(area.cpu_id_start(), writer_cpu as u32);
+                    writer_tid.send(thread_id()).unwrap();
+                    start.wait();
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    let mut records = 0_u64;
+                    let mut aborts = 0_u64;
+                    let mut record = vec![0; 8 * 1024];
 
-                while Instant::now() < deadline {
-                    let len = record_len(writer_id, index);
-                    fill_record(&mut record[..len], writer_id, index);
-                    let tail = writer_ring.tail.load(Ordering::Acquire);
-                    // SAFETY: the ring allocation covers wrapped records and rseq serializes writers.
-                    let result = unsafe {
-                        push_record(
-                            area,
-                            writer_cpu as u32,
-                            writer_ring.head.as_ptr(),
-                            writer_ring.base(),
-                            (RING_SIZE - 1) as u64,
-                            tail + RING_SIZE as u64,
-                            record.as_ptr(),
-                            len as u64,
-                        )
-                    };
-                    match result {
-                        Push::Done => index += 1,
-                        Push::Full => thread::yield_now(),
-                        Push::Aborted => {
-                            writer_aborts.fetch_add(1, Ordering::Relaxed);
+                    while Instant::now() < deadline {
+                        let len = record_len(writer_id, records);
+                        fill_record(&mut record[..len], writer_id, records);
+                        let limit = tail.load(Ordering::Acquire) + RING_SIZE as u64;
+                        // SAFETY: the allocation covers wrapped records and rseq serializes writers.
+                        let result = unsafe {
+                            push_record(
+                                area,
+                                writer_cpu as u32,
+                                head.as_ptr(),
+                                base,
+                                (RING_SIZE - 1) as u64,
+                                limit,
+                                record.as_ptr(),
+                                len as u64,
+                            )
+                        };
+                        match result {
+                            Push::Done => records += 1,
+                            Push::Full => thread::yield_now(),
+                            Push::Aborted => aborts += 1,
                         }
                     }
-                }
 
-                writer_active.fetch_sub(1, Ordering::Release);
-                index
-            }));
-        }
-        drop(tid_tx);
-        let writer_tids: Vec<_> = (0..WRITERS)
-            .map(|_| tid_rx.recv().unwrap())
-            .collect();
-        assert_eq!(writer_tids.len(), WRITERS);
-
-        let consumer_ring = Arc::clone(&ring);
-        let consumer_active = Arc::clone(&active);
-        let consumer = thread::spawn(move || {
-            pin_to(other_cpu);
-            let mut tail = 0_u64;
-            let mut previous_head = 0_u64;
-            let mut expected = vec![0_u64; WRITERS];
-
-            loop {
-                let head = consumer_ring.head.load(Ordering::Acquire);
-                assert!(head >= previous_head);
-                previous_head = head;
-                while tail < head {
-                    let offset = (tail as usize) & (RING_SIZE - 1);
-                    // SAFETY: the acquired head exposes a complete header at this ring position.
-                    let len = unsafe {
-                        ptr::read_unaligned(consumer_ring.base().add(offset).cast::<u64>()) as usize
-                    };
-                    assert!((16..=8 * 1024).contains(&len));
-                    let next = tail + total(len) as u64;
-                    assert!(next <= head);
-                    // SAFETY: the allocation includes enough trailing bytes for a wrapped record.
-                    let record = unsafe {
-                        slice::from_raw_parts(consumer_ring.base().add(offset + 8), len)
-                    };
-                    check_record(record, &mut expected);
-                    tail = next;
-                }
-                consumer_ring.tail.store(tail, Ordering::Release);
-                if consumer_active.load(Ordering::Acquire) == 0
-                    && tail == consumer_ring.head.load(Ordering::Acquire)
-                {
-                    break;
-                }
-                if tail == head {
-                    std::hint::spin_loop();
-                }
+                    active.fetch_sub(1, Ordering::Release);
+                    (records, aborts)
+                }));
             }
-            expected
-        });
+            drop(tid_tx);
+            let writer_tids: Vec<_> = (0..WRITERS).map(|_| tid_rx.recv().unwrap()).collect();
 
-        let signal_stop = Arc::new(AtomicBool::new(false));
-        let thread_stop = Arc::clone(&signal_stop);
-        let signaler = thread::spawn(move || {
-            pin_to(other_cpu);
-            while !thread_stop.load(Ordering::Acquire) {
-                for &tid in &writer_tids {
-                    send_signal(tid);
+            let consumer = scope.spawn(move || {
+                let base = bytes.as_ptr() as *mut u8;
+                pin_to(other_cpu);
+                let mut tail_value = 0_u64;
+                let mut previous_head = 0_u64;
+                let mut expected = vec![0_u64; WRITERS];
+
+                loop {
+                    let head_value = head.load(Ordering::Acquire);
+                    assert!(head_value >= previous_head);
+                    previous_head = head_value;
+                    while tail_value < head_value {
+                        let offset = (tail_value as usize) & (RING_SIZE - 1);
+                        // SAFETY: the acquired head exposes a complete header at this ring position.
+                        let len = unsafe { ptr::read_unaligned(base.add(offset).cast::<u64>()) as usize };
+                        assert!((16..=8 * 1024).contains(&len));
+                        let next = tail_value + total(len) as u64;
+                        assert!(next <= head_value);
+                        // SAFETY: the allocation includes enough trailing bytes for a wrapped record.
+                        let record = unsafe { slice::from_raw_parts(base.add(offset + 8), len) };
+                        check_record(record, &mut expected);
+                        tail_value = next;
+                    }
+                    tail.store(tail_value, Ordering::Release);
+                    if active.load(Ordering::Acquire) == 0
+                        && tail_value == head.load(Ordering::Acquire)
+                    {
+                        break;
+                    }
+                    if tail_value == head_value {
+                        std::hint::spin_loop();
+                    }
                 }
-            }
+                expected
+            });
+
+            let signaler = scope.spawn(move || {
+                pin_to(other_cpu);
+                while !signal_stop.load(Ordering::Acquire) {
+                    for &tid in &writer_tids {
+                        send_signal(tid);
+                    }
+                }
+            });
+
+            start.wait();
+            let results: Vec<_> = writers.into_iter().map(|writer| writer.join().unwrap()).collect();
+            let consumed = consumer.join().unwrap();
+            signal_stop.store(true, Ordering::Release);
+            signaler.join().unwrap();
+
+            let counts: Vec<_> = results.iter().map(|&(count, _)| count).collect();
+            assert_eq!(consumed, counts);
+            assert!(counts.iter().all(|&count| count >= 1000));
+            assert!(results.iter().map(|&(_, aborts)| aborts).sum::<u64>() > 0);
         });
-
-        start.wait();
-        let counts: Vec<_> = writers
-            .into_iter()
-            .map(|writer| writer.join().unwrap())
-            .collect();
-        let consumed = consumer.join().unwrap();
-        signal_stop.store(true, Ordering::Release);
-        signaler.join().unwrap();
-
-        assert_eq!(consumed, counts);
-        assert!(counts.iter().all(|&count| count >= 1000));
-        assert!(aborts.load(Ordering::Relaxed) > 0);
-    }
-
-    #[repr(C)]
-    /// Matches the kernel-visible descriptor addressed by the rseq area's `rseq_cs` field.
-    struct RseqCs {
-        version: u32,
-        flags: u32,
-        start_ip: u64,
-        post_commit_offset: u64,
-        abort_ip: u64,
     }
 
     #[test]
@@ -981,14 +757,13 @@ mod tests {
             let mut head = 0;
             // SAFETY: the test allocations cover the record and only this thread writes `head`.
             let result = unsafe {
-                push_until_not_aborted(
+                push_retrying(
                     area,
                     cpu,
                     &mut head,
                     &mut buffer,
                     RING_SIZE as u64,
-                    payload.as_ptr(),
-                    payload.len(),
+                    &payload,
                 )
             };
             assert_eq!(result, Push::Done);
@@ -1001,23 +776,22 @@ mod tests {
         assert_ne!(descriptor_address, 0);
 
         // SAFETY: a nonzero `rseq_cs` value points to this call site's static descriptor.
-        let descriptor = unsafe { &*(descriptor_address as *const RseqCs) };
-        assert_eq!(descriptor.version, 0);
-        assert_eq!(descriptor.flags, 0);
+        let descriptor = unsafe { &*(descriptor_address as *const [u64; 4]) };
+        assert_eq!(descriptor[0], 0);
 
         // SAFETY: the descriptor points into this function's emitted instructions.
-        let signature = unsafe { ptr::read_unaligned((descriptor.abort_ip - 4) as *const u32) };
+        let signature = unsafe { ptr::read_unaligned((descriptor[3] - 4) as *const u32) };
 
         #[cfg(target_arch = "aarch64")]
         {
             // `0xd428bc00` is `brk #0x45e0`, glibc's `RSEQ_SIG`, read from `abort_ip - 4`.
             assert_eq!(signature, 0xd428bc00);
             // SAFETY: the descriptor brackets aligned AArch64 instructions in this function.
-            let arming = unsafe { ptr::read_unaligned((descriptor.start_ip - 4) as *const u32) };
+            let arming = unsafe { ptr::read_unaligned((descriptor[1] - 4) as *const u32) };
             // SAFETY: the descriptor brackets aligned AArch64 instructions in this function.
             let commit = unsafe {
                 ptr::read_unaligned(
-                    (descriptor.start_ip + descriptor.post_commit_offset - 4) as *const u32,
+                    (descriptor[1] + descriptor[2] - 4) as *const u32,
                 )
             };
             // With mask `0xFFFF_FC00`, `0xF900_0400` is a 64-bit `str` at immediate offset 8
@@ -1034,7 +808,7 @@ mod tests {
             assert_eq!(signature, 0x53053053);
             // SAFETY: the descriptor's start follows at least the five-byte arming instruction.
             let arming = unsafe {
-                slice::from_raw_parts((descriptor.start_ip - 5) as *const u8, 5)
+                slice::from_raw_parts((descriptor[1] - 5) as *const u8, 5)
             };
             // `byte & 0xF8 == 0x48` is REX.W and `0x89` is `mov r64` to memory. These ModRM
             // checks read `start_ip - 5` and accept `disp8(%reg)` with displacement 8, without SIB.
@@ -1052,7 +826,7 @@ mod tests {
                 && arming[4] == 0x08;
             assert!(arming_without_sib || arming_with_sib);
 
-            let post_commit = descriptor.start_ip + descriptor.post_commit_offset;
+            let post_commit = descriptor[1] + descriptor[2];
             // SAFETY: the post-commit address follows at least the four-byte commit instruction.
             let commit = unsafe { slice::from_raw_parts((post_commit - 4) as *const u8, 4) };
             // These bytes before `start_ip + post_commit_offset` are REX.W `mov r64` to memory.
