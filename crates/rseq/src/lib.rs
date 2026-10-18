@@ -300,6 +300,13 @@ pub unsafe fn push_record(
 
 #[cfg(test)]
 mod tests {
+    // `record_layout` checks the header, payload, padding, and head written by `push_record`.
+    // `full_boundaries_do_not_write` checks that `Full` leaves the head and destination unchanged.
+    // `wrong_cpu_does_not_write` checks that a mismatched CPU aborts before any write.
+    // `source_is_not_read_past_length` checks that copying stops exactly at `len`.
+    // `signals_abort_one_writer` checks that a signal aborts or completes one writer cleanly.
+    // `same_cpu_writers_are_serialized` checks that two writers do not commit into one ring slot.
+    // `descriptor_brackets_arming_and_commit` checks that the rseq descriptor covers both stores.
     use super::*;
     use std::cell::UnsafeCell;
     use std::mem;
@@ -311,6 +318,7 @@ mod tests {
 
     const RING_SIZE: usize = 64 * 1024;
 
+    /// Pins this test thread to `cpu` so its registered rseq CPU value is predictable.
     fn pin_to(cpu: usize) {
         // SAFETY: `set` is initialized before it is passed to `sched_setaffinity`.
         unsafe {
@@ -324,6 +332,7 @@ mod tests {
         }
     }
 
+    /// Returns the CPUs to which the current process is allowed to bind test threads.
     fn available_cpus() -> Vec<usize> {
         // SAFETY: `set` is initialized by `sched_getaffinity` before it is inspected.
         unsafe {
@@ -338,6 +347,7 @@ mod tests {
         }
     }
 
+    /// Pins the current thread and returns its registered rseq area with the matching CPU id.
     fn pinned_area() -> (ThreadArea, u32) {
         let cpu = available_cpus()[0];
         pin_to(cpu);
@@ -346,10 +356,14 @@ mod tests {
         (area, cpu as u32)
     }
 
+    /// Returns the eight-byte header plus the payload rounded up to its eight-byte record size.
     fn total(len: usize) -> usize {
         8 + (len + 7) / 8 * 8
     }
 
+    /// Calls `push_record` with the common test ring layout.
+    ///
+    /// The caller must provide storage for the record and keep this thread as the sole head writer.
     unsafe fn push(
         area: ThreadArea,
         cpu: u32,
@@ -374,6 +388,9 @@ mod tests {
         }
     }
 
+    /// Retries `push` after rseq aborts caused by preemption, which pinning does not prevent.
+    ///
+    /// The retry count is bounded so an implementation that aborts every attempt fails promptly.
     unsafe fn push_until_not_aborted(
         area: ThreadArea,
         cpu: u32,
@@ -396,6 +413,10 @@ mod tests {
     }
 
     #[test]
+    /// Writes payloads at alignment boundaries and checks their header, bytes, padding, and head.
+    ///
+    /// This catches a wrong length header, a bad payload copy, bad padding, or an incorrect head
+    /// advance.
     fn record_layout() {
         let (area, cpu) = pinned_area();
         for len in [0, 1, 7, 8, 9, 15, 16, 17, 100] {
@@ -425,6 +446,11 @@ mod tests {
     }
 
     #[test]
+    /// Tries a record at its exact limit, one byte below it, and with a stale limit behind the
+    /// head.
+    ///
+    /// The fitting record must finish. Both `Full` cases must leave the head and bytes unchanged,
+    /// catching a full check that writes before it fails.
     fn full_boundaries_do_not_write() {
         let (area, cpu) = pinned_area();
         let payload = [0x35; 17];
@@ -487,6 +513,10 @@ mod tests {
     }
 
     #[test]
+    /// Supplies a CPU id different from the thread's pinned CPU for an otherwise valid record.
+    ///
+    /// It requires `Aborted` with an untouched head and buffer. This catches work done after a
+    /// failed CPU check, which should abort the critical section.
     fn wrong_cpu_does_not_write() {
         let (area, cpu) = pinned_area();
         let payload = [0x71; 16];
@@ -513,6 +543,12 @@ mod tests {
     }
 
     #[test]
+    /// Places payloads immediately before a protected page and copies every length through
+    /// seventeen bytes.
+    ///
+    /// Each call must finish and reproduce exactly `len` bytes; a read past `src + len` faults,
+    /// enters the rseq abort handler, and appears here as endless `Aborted` retries rather than a
+    /// process crash.
     fn source_is_not_read_past_length() {
         let (area, cpu) = pinned_area();
         // SAFETY: the mapping is checked for failure, then split into one readable and one guard page.
@@ -554,8 +590,10 @@ mod tests {
         }
     }
 
+    /// Accepts `SIGUSR1` so delivery can interrupt rseq without terminating the test process.
     extern "C" fn ignore_signal(_: libc::c_int) {}
 
+    /// Installs `ignore_signal` once for all tests that inject `SIGUSR1` into writer threads.
     fn install_signal_handler() {
         static INSTALL: Once = Once::new();
         INSTALL.call_once(|| {
@@ -570,11 +608,13 @@ mod tests {
         });
     }
 
+    /// Returns this Linux thread's kernel thread id for `tgkill`.
     fn thread_id() -> libc::pid_t {
         // SAFETY: `gettid` has no pointer arguments or caller obligations.
         unsafe { libc::syscall(libc::SYS_gettid) as libc::pid_t }
     }
 
+    /// Sends the test signal to `tid`, returning false when that thread has already exited.
     fn send_signal(tid: libc::pid_t) -> bool {
         // SAFETY: `tgkill` receives the current process and a thread id obtained from `gettid`.
         unsafe {
@@ -583,6 +623,11 @@ mod tests {
     }
 
     #[test]
+    /// Sends `SIGUSR1` repeatedly while one pinned writer copies large records into a local ring.
+    ///
+    /// Completed records must be intact and aborted records must leave `head` at zero. This catches
+    /// an abort path that exposes partial work or a critical section that cannot be interrupted
+    /// safely.
     fn signals_abort_one_writer() {
         install_signal_handler();
         let cpu = available_cpus()[0];
@@ -657,6 +702,7 @@ mod tests {
         assert!(done > 0);
     }
 
+    /// Ring storage shared by concurrent writers and one consumer in the serialization test.
     struct ConcurrentRing {
         head: AtomicU64,
         tail: AtomicU64,
@@ -667,6 +713,8 @@ mod tests {
     unsafe impl Sync for ConcurrentRing {}
 
     impl ConcurrentRing {
+        /// Allocates an initialized ring with trailing space for records that wrap at the ring
+        /// boundary.
         fn new() -> ConcurrentRing {
             ConcurrentRing {
                 head: AtomicU64::new(0),
@@ -678,15 +726,19 @@ mod tests {
             }
         }
 
+        /// Returns the byte address passed to `push_record` and used by the consumer to read
+        /// records.
         fn base(&self) -> *mut u8 {
             self.bytes.as_ptr().cast::<u8>() as *mut u8
         }
     }
 
+    /// Derives a nonconstant record length from its writer and per-writer sequence number.
     fn record_len(writer: usize, index: u64) -> usize {
         16 + (index as usize * 7919 + writer * 101) % (8 * 1024 - 15)
     }
 
+    /// Encodes a writer id, sequence number, and deterministic payload into one test record.
     fn fill_record(record: &mut [u8], writer: usize, index: u64) {
         record[..8].copy_from_slice(&(writer as u64).to_ne_bytes());
         record[8..16].copy_from_slice(&index.to_ne_bytes());
@@ -695,6 +747,8 @@ mod tests {
         }
     }
 
+    /// Verifies a consumed record's writer sequence and contents, then advances that writer's
+    /// expectation.
     fn check_record(record: &[u8], expected: &mut [u64]) {
         let writer = u64::from_ne_bytes(record[..8].try_into().unwrap()) as usize;
         let index = u64::from_ne_bytes(record[8..16].try_into().unwrap());
@@ -708,6 +762,10 @@ mod tests {
     }
 
     #[test]
+    /// Runs two signalled writers pinned to one CPU while a second CPU consumes their shared ring.
+    ///
+    /// The consumer must see every writer's records in order and no corrupted record. This catches
+    /// two writers committing into one ring slot or publishing a partial record.
     fn same_cpu_writers_are_serialized() {
         const WRITERS: usize = 2;
 
@@ -842,6 +900,7 @@ mod tests {
     }
 
     #[repr(C)]
+    /// Matches the kernel-visible descriptor addressed by the rseq area's `rseq_cs` field.
     struct RseqCs {
         version: u32,
         flags: u32,
@@ -851,6 +910,12 @@ mod tests {
     }
 
     #[test]
+    /// Finds the descriptor published by a completed `push_record` and inspects its instruction
+    /// boundaries.
+    ///
+    /// It requires glibc's abort signature, an arming store immediately before `start_ip`, and a
+    /// commit store immediately before `post_commit_offset`, catching a missing signature or stores
+    /// outside the declared critical section.
     fn descriptor_brackets_arming_and_commit() {
         let (area, cpu) = pinned_area();
         let payload = [0x5a; 8];
@@ -890,6 +955,7 @@ mod tests {
 
         #[cfg(target_arch = "aarch64")]
         {
+            // `0xd428bc00` is `brk #0x45e0`, glibc's `RSEQ_SIG`, read from `abort_ip - 4`.
             assert_eq!(signature, 0xd428bc00);
             // SAFETY: the descriptor brackets aligned AArch64 instructions in this function.
             let arming = unsafe { ptr::read_unaligned((descriptor.start_ip - 4) as *const u32) };
@@ -899,22 +965,31 @@ mod tests {
                     (descriptor.start_ip + descriptor.post_commit_offset - 4) as *const u32,
                 )
             };
+            // With mask `0xFFFF_FC00`, `0xF900_0400` is a 64-bit `str` at immediate offset 8
+            // with any registers. It is read before `start_ip` as the arming store to rseq_cs.
             assert_eq!(arming & 0xffff_fc00, 0xf900_0400);
+            // With the same mask, `0xC89F_FC00` is a 64-bit `stlr` with any registers. It is read
+            // before `start_ip + post_commit_offset` as the commit store to `head`.
             assert_eq!(commit & 0xffff_fc00, 0xc89f_fc00);
         }
 
         #[cfg(target_arch = "x86_64")]
         {
+            // `0x53053053` is glibc's `RSEQ_SIG`, read from the four bytes before `abort_ip`.
             assert_eq!(signature, 0x53053053);
             // SAFETY: the descriptor's start follows at least the five-byte arming instruction.
             let arming = unsafe {
                 slice::from_raw_parts((descriptor.start_ip - 5) as *const u8, 5)
             };
+            // `byte & 0xF8 == 0x48` is REX.W and `0x89` is `mov r64` to memory. These ModRM
+            // checks read `start_ip - 5` and accept `disp8(%reg)` with displacement 8, without SIB.
             let arming_without_sib = arming[1] & 0xf8 == 0x48
                 && arming[2] == 0x89
                 && arming[3] & 0xc0 == 0x40
                 && arming[3] & 0x07 != 4
                 && arming[4] == 0x08;
+            // The same REX.W `mov r64` to memory at `start_ip - 5` uses SIB when the base is
+            // rsp/r12.
             let arming_with_sib = arming[0] & 0xf8 == 0x48
                 && arming[1] == 0x89
                 && arming[2] & 0xc7 == 0x44
@@ -925,14 +1000,19 @@ mod tests {
             let post_commit = descriptor.start_ip + descriptor.post_commit_offset;
             // SAFETY: the post-commit address follows at least the four-byte commit instruction.
             let commit = unsafe { slice::from_raw_parts((post_commit - 4) as *const u8, 4) };
+            // These bytes before `start_ip + post_commit_offset` are REX.W `mov r64` to memory.
+            // The ModRM form is `(%reg)` except bases rsp/r12 and rbp/r13, which need other forms.
             let commit_without_suffix = commit[1] & 0xf8 == 0x48
                 && commit[2] == 0x89
                 && commit[3] & 0xc0 == 0
                 && !matches!(commit[3] & 0x07, 4 | 5);
+            // This is the SIB `(%reg)` form for an rsp/r12 base, read before the commit boundary.
             let commit_with_sib = commit[0] & 0xf8 == 0x48
                 && commit[1] == 0x89
                 && commit[2] & 0xc7 == 0x04
                 && commit[3] == 0x24;
+            // This is the zero-displacement form required for an rbp/r13 base before the commit
+            // boundary.
             let commit_with_displacement = commit[0] & 0xf8 == 0x48
                 && commit[1] == 0x89
                 && commit[2] & 0xc7 == 0x45
