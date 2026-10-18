@@ -1,0 +1,14 @@
+[package]
+name = "ceph-fifo"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "ceph_fifo"
+
+[dependencies]
+ceph-proto.workspace = true
+ceph-ring.workspace = true
+
+[dev-dependencies]
+libc.workspace = true

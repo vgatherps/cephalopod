@@ -18,7 +18,7 @@ const TAILS_OFFSET: usize = 4096;
 const STAGGER: u64 = 128;
 
 #[repr(C)]
-struct Header {
+struct ShmHeader {
     magic: AtomicU64,
     nr_rings: u64,
     ring_size: u64,
@@ -30,6 +30,13 @@ struct Header {
 pub struct Config {
     pub ring_size: usize,
     pub max_record: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Header {
+    pub stream: u64,
+    pub seq: u64,
+    pub len: usize,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -108,8 +115,8 @@ impl Map {
 
     #[cfg(not(target_os = "linux"))]
     fn lock(&self) -> &AtomicU32 {
-        // SAFETY: `Header` starts at the beginning of the metadata mapping.
-        unsafe { &(*self.meta.cast::<Header>()).lock }
+        // SAFETY: `ShmHeader` starts at the beginning of the metadata mapping.
+        unsafe { &(*self.meta.cast::<ShmHeader>()).lock }
     }
 }
 
@@ -131,6 +138,7 @@ pub struct Reader {
     name: CString,
     max_record: usize,
     tails: Vec<u64>,
+    dirty: Vec<bool>,
 }
 
 pub struct Record<'a> {
@@ -177,7 +185,7 @@ impl Reader {
             shared_tail.store(position, Relaxed);
             tails.push(position);
         }
-        let header = map.meta.cast::<Header>();
+        let header = map.meta.cast::<ShmHeader>();
         // SAFETY: the header is in the mapping; writers read the other fields only after seeing
         // `magic`.
         unsafe {
@@ -191,6 +199,7 @@ impl Reader {
             name,
             max_record,
             tails,
+            dirty: vec![false; nr_rings],
         })
     }
 
@@ -199,7 +208,8 @@ impl Reader {
     }
 
     /// Appends to `out` every ring whose current tail appears to hold a committed record. This
-    /// is only a hint: `read` performs the Acquire load required before consuming a record.
+    /// is only a hint: `front` and `read` perform the Acquire load required before consuming a
+    /// record.
     pub fn poll(&self, out: &mut Vec<usize>) {
         let mask = self.map.ring_size as u64 - 1;
         for ring in 0..self.nr_rings() {
@@ -219,44 +229,119 @@ impl Reader {
         }
     }
 
+    /// Acquire-loads the tag at `ring`'s tail and returns a copy of the committed record's
+    /// header. Nothing is consumed.
+    pub fn front(&self, ring: usize) -> Option<Header> {
+        let tail = self.tails[ring];
+        let start = self.record_start(ring, tail);
+        // SAFETY: record starts are 8-aligned and the ring is mapped twice contiguously.
+        let tag = unsafe { (&*start.add(TAG_OFFSET).cast::<AtomicU64>()).load(Acquire) };
+        if tag != tag_for(tail) {
+            return None;
+        }
+        // SAFETY: acquiring the committed tag makes the record header visible.
+        let len = unsafe { start.add(LEN_OFFSET).cast::<u64>().read() as usize };
+        assert!(
+            len <= self.max_record,
+            "ring {ring}: record length {len} at {tail}"
+        );
+        Some(Header {
+            // SAFETY: acquiring the committed tag makes the record header visible.
+            stream: unsafe { start.add(STREAM_OFFSET).cast::<u64>().read() },
+            // SAFETY: acquiring the committed tag makes the record header visible.
+            seq: unsafe { start.add(SEQ_OFFSET).cast::<u64>().read() },
+            len,
+        })
+    }
+
+    /// Advances the local tail past the record reported by `front` and returns its view.
+    /// Panics if no record is committed. It does not write shared memory, and the returned bytes
+    /// remain valid until the next `publish`.
+    pub fn take(&mut self, ring: usize) -> Record<'_> {
+        let tail = self.tails[ring];
+        let start = self.record_start(ring, tail);
+        // SAFETY: record starts are 8-aligned and the ring is mapped twice contiguously.
+        let tag = unsafe { (&*start.add(TAG_OFFSET).cast::<AtomicU64>()).load(Relaxed) };
+        assert_eq!(tag, tag_for(tail), "ring {ring}: no record at {tail}");
+        // SAFETY: the caller acquired this record's tag through `front`.
+        let len = unsafe { start.add(LEN_OFFSET).cast::<u64>().read() as usize };
+        assert!(
+            len <= self.max_record,
+            "ring {ring}: record length {len} at {tail}"
+        );
+        // SAFETY: the caller acquired this record's tag through `front`.
+        let stream = unsafe { start.add(STREAM_OFFSET).cast::<u64>().read() };
+        // SAFETY: the caller acquired this record's tag through `front`.
+        let seq = unsafe { start.add(SEQ_OFFSET).cast::<u64>().read() };
+        self.tails[ring] = tail + record_total(len as u64);
+        self.dirty[ring] = true;
+        Record {
+            stream,
+            seq,
+            // SAFETY: the record fits in the double mapping and remains owned by the reader
+            // until its updated tail is published.
+            payload: unsafe {
+                slice::from_raw_parts(start.add(ceph_rseq::HEADER_LEN as usize), len)
+            },
+        }
+    }
+
+    /// Release-stores every local tail that moved since the previous publish.
+    pub fn publish(&mut self) {
+        for ring in 0..self.nr_rings() {
+            self.publish_ring(ring);
+        }
+    }
+
     /// Visits committed records in `ring`. Stops before the first record for which `f` returns
     /// false and leaves it in the ring. Returns the number of records consumed.
     pub fn read(&mut self, ring: usize, mut f: impl FnMut(Record<'_>) -> bool) -> usize {
-        let (base, _, shared_tail) = self.map.ring(ring);
-        let mask = self.map.ring_size as u64 - 1;
-        let mut tail = self.tails[ring];
         let mut consumed = 0;
         loop {
-            // SAFETY: record starts are 8-aligned and the ring is mapped twice contiguously.
-            let record = unsafe {
-                let start = base.add((tail & mask) as usize);
-                let tag = (&*start.add(TAG_OFFSET).cast::<AtomicU64>()).load(Acquire);
-                if tag != tag_for(tail) {
-                    break;
-                }
-                let len = start.add(LEN_OFFSET).cast::<u64>().read() as usize;
-                assert!(
-                    len <= self.max_record,
-                    "ring {ring}: record length {len} at {tail}"
-                );
-                Record {
-                    stream: start.add(STREAM_OFFSET).cast::<u64>().read(),
-                    seq: start.add(SEQ_OFFSET).cast::<u64>().read(),
-                    payload: slice::from_raw_parts(start.add(ceph_rseq::HEADER_LEN as usize), len),
-                }
+            let Some(_) = self.front(ring) else {
+                break;
             };
-            let total = record_total(record.payload.len() as u64);
+            let record = self.record(ring);
             if !f(record) {
                 break;
             }
-            tail += total;
+            drop(self.take(ring));
             consumed += 1;
         }
-        if tail != self.tails[ring] {
-            self.tails[ring] = tail;
-            shared_tail.store(tail, Release);
-        }
+        self.publish_ring(ring);
         consumed
+    }
+
+    fn record_start(&self, ring: usize, tail: u64) -> *mut u8 {
+        let (base, _, _) = self.map.ring(ring);
+        let mask = self.map.ring_size as u64 - 1;
+        // The ring is mapped twice, so a record can cross its physical end contiguously.
+        unsafe { base.add((tail & mask) as usize) }
+    }
+
+    fn record(&self, ring: usize) -> Record<'_> {
+        let start = self.record_start(ring, self.tails[ring]);
+        // SAFETY: `front` acquired the committed tag before this helper is called.
+        let len = unsafe { start.add(LEN_OFFSET).cast::<u64>().read() as usize };
+        Record {
+            // SAFETY: `front` acquired the committed tag before this helper is called.
+            stream: unsafe { start.add(STREAM_OFFSET).cast::<u64>().read() },
+            // SAFETY: `front` acquired the committed tag before this helper is called.
+            seq: unsafe { start.add(SEQ_OFFSET).cast::<u64>().read() },
+            // SAFETY: `front` verified the committed record and its length, which cannot change
+            // before this ring's tail is published.
+            payload: unsafe {
+                slice::from_raw_parts(start.add(ceph_rseq::HEADER_LEN as usize), len)
+            },
+        }
+    }
+
+    fn publish_ring(&mut self, ring: usize) {
+        if self.dirty[ring] {
+            let (_, _, shared_tail) = self.map.ring(ring);
+            shared_tail.store(self.tails[ring], Release);
+            self.dirty[ring] = false;
+        }
     }
 }
 
@@ -299,7 +384,7 @@ impl Writer {
                 fd.as_raw_fd(),
                 0,
             )?
-            .cast::<Header>()
+            .cast::<ShmHeader>()
         };
         // SAFETY: the header is in the temporary mapping.
         let magic = unsafe { (*header).magic.load(Acquire) };
