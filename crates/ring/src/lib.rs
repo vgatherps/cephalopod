@@ -147,11 +147,10 @@ impl Reader {
             ring_size.is_power_of_two() && ring_size % page_size() == 0,
             "ring_size {ring_size} must be a power of two and a multiple of the page size"
         );
+        // Equivalent to record_total(max_record) + 8 <= ring_size, written so a huge
+        // max_record cannot overflow the addition in record_total.
         assert!(
-            u64::try_from(max_record)
-                .ok()
-                .and_then(|n| record_total(n).checked_add(8))
-                .is_some_and(|n| n <= ring_size as u64),
+            max_record <= ring_size - ceph_rseq::HEADER_LEN as usize - 8,
             "record_total({max_record}) + 8 exceeds ring_size {ring_size}"
         );
         #[cfg(target_os = "linux")]
@@ -243,8 +242,8 @@ pub struct Writer {
 }
 
 // SAFETY: the mappings are process-wide. `try_push` writes a ring only inside `push_record` on the
-// calling thread's current CPU (off Linux, only under the ring's spinlock), and heads and tails are
-// atomics.
+// calling thread's current CPU (off Linux, only under the header spinlock), and the tails and
+// private lines are atomics.
 unsafe impl Send for Writer {}
 unsafe impl Sync for Writer {}
 
