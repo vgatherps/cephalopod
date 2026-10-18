@@ -17,6 +17,7 @@ fn push_and_read_back() {
     for (seq, r) in records.iter().enumerate() {
         writer.try_push(r, 11, seq as u64).unwrap();
     }
+    assert!(!reader.poll().is_empty());
     // A Linux thread can migrate between pushes, so order holds within each ring only.
     let mut seen = Vec::new();
     for ring in 0..reader.nr_rings() {

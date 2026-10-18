@@ -3,7 +3,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::ptr;
 use std::slice;
-use std::sync::atomic::Ordering::{Acquire, Release};
+use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use std::sync::atomic::{AtomicU32, AtomicU64};
 
 use ceph_rseq::{
@@ -14,6 +14,8 @@ use ceph_rseq::{Push, ThreadArea, push_record};
 
 const MAGIC: u64 = u64::from_le_bytes(*b"cephring");
 const TAILS_OFFSET: usize = 4096;
+// Spread initial tag words across L1 cache sets.
+const STAGGER: u64 = 128;
 
 #[repr(C)]
 struct Header {
@@ -129,6 +131,7 @@ pub struct Reader {
     name: CString,
     max_record: usize,
     tails: Vec<u64>,
+    polled: Vec<usize>,
 }
 
 pub struct Record<'a> {
@@ -167,6 +170,14 @@ impl Reader {
             return Err(io::Error::last_os_error());
         }
         let map = Map::new(&fd, nr_rings, ring_size)?;
+        let mut tails = Vec::with_capacity(nr_rings);
+        for k in 0..nr_rings {
+            let position = k as u64 * STAGGER;
+            let (_, private, shared_tail) = map.ring(k);
+            private.head.store(position, Relaxed);
+            shared_tail.store(position, Relaxed);
+            tails.push(position);
+        }
         let header = map.meta.cast::<Header>();
         // SAFETY: the header is in the mapping; writers read the other fields only after seeing
         // `magic`.
@@ -180,12 +191,36 @@ impl Reader {
             map,
             name,
             max_record,
-            tails: vec![0; nr_rings],
+            tails,
+            polled: Vec::new(),
         })
     }
 
     pub fn nr_rings(&self) -> usize {
         self.tails.len()
+    }
+
+    /// Polls rings whose current tail appears to contain a committed record.
+    /// This is only a hint; `read` performs the Acquire load required before consuming a record.
+    pub fn poll(&mut self) -> &[usize] {
+        self.polled.clear();
+        let mask = self.map.ring_size as u64 - 1;
+        for ring in 0..self.nr_rings() {
+            let tail = self.tails[ring];
+            let (base, _, _) = self.map.ring(ring);
+            // SAFETY: record starts are 8-aligned and the ring is mapped twice contiguously.
+            let tag = unsafe {
+                (&*base
+                    .add((tail & mask) as usize)
+                    .add(TAG_OFFSET)
+                    .cast::<AtomicU64>())
+                    .load(Relaxed)
+            };
+            if tag == tag_for(tail) {
+                self.polled.push(ring);
+            }
+        }
+        &self.polled
     }
 
     /// Visits committed records in `ring`. Stops before the first record for which `f` returns

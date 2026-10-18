@@ -73,6 +73,7 @@ fn round_trip_and_wrap() {
                 Err(e) => panic!("{e:?}"),
             }
         }
+        assert_eq!(reader.poll(), [k]);
         reader.read(k, &mut check);
         assert_eq!(next, pushed);
         for other in (0..reader.nr_rings()).filter(|&r| r != k) {
