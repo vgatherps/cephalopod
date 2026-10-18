@@ -82,7 +82,8 @@ pub enum Push {
 /// `head` must be 8-aligned and only written through this function by threads running on `cpu`.
 /// `base + (*head & mask)` must be writable for `8 + round_up(len, 8)` bytes. `limit` must equal
 /// a tail loaded with `Acquire` plus the ring size. A stale tail is safe because tail only grows.
-/// Positions and their additions must not wrap. `src` must be readable for `len` bytes.
+/// Positions and their additions must not wrap. `src` must be readable for `len` bytes and must
+/// not overlap the destination record or `*head`. The destination record must not overlap `*head`.
 pub unsafe fn push_record(
     area: ThreadArea,
     cpu: u32,
@@ -179,7 +180,8 @@ pub unsafe fn push_record(
             ".long 0, 0",
             ".quad 30f, 40f - 30f, 60f",
             ".popsection",
-            "adr {tmp}, 20b",
+            "adrp {tmp}, 20b",
+            "add {tmp}, {tmp}, :lo12:20b",
             "str {tmp}, [{area}, #8]",
             "30:",
             "ldr {h:w}, [{area}, #4]",
@@ -322,6 +324,27 @@ mod tests {
         }
     }
 
+    unsafe fn push_until_not_aborted(
+        area: ThreadArea,
+        cpu: u32,
+        head: &mut u64,
+        buffer: &mut [u8],
+        limit: u64,
+        src: *const u8,
+        len: usize,
+    ) -> Push {
+        for _ in 0..10_000 {
+            let head_before = *head;
+            // SAFETY: the caller satisfies `push`'s test allocation contract.
+            let result = unsafe { push(area, cpu, head, buffer, limit, src, len) };
+            if result != Push::Aborted {
+                return result;
+            }
+            assert_eq!(*head, head_before);
+        }
+        panic!("push aborted 10000 consecutive times");
+    }
+
     #[test]
     fn record_layout() {
         let (area, cpu) = pinned_area();
@@ -332,7 +355,7 @@ mod tests {
 
             // SAFETY: `buffer` and `payload` satisfy `push`'s test allocation contract.
             let result = unsafe {
-                push(
+                push_until_not_aborted(
                     area,
                     cpu,
                     &mut head,
@@ -361,7 +384,7 @@ mod tests {
         let mut exact_head = 0;
         // SAFETY: the test allocations cover the record and only this thread writes the head.
         let exact = unsafe {
-            push(
+            push_until_not_aborted(
                 area,
                 cpu,
                 &mut exact_head,
@@ -379,7 +402,7 @@ mod tests {
         let mut short_head = 0;
         // SAFETY: the full check runs before the otherwise valid destination is written.
         let short = unsafe {
-            push(
+            push_until_not_aborted(
                 area,
                 cpu,
                 &mut short_head,
@@ -398,7 +421,7 @@ mod tests {
         let mut stale_head = 10 * RING_SIZE as u64;
         // SAFETY: the stale limit makes the full check fail before any destination write.
         let stale = unsafe {
-            push(
+            push_until_not_aborted(
                 area,
                 cpu,
                 &mut stale_head,
@@ -464,7 +487,7 @@ mod tests {
                 }
                 let mut buffer = vec![0xaa; RING_SIZE + total(17)];
                 let mut head = 0;
-                let result = push(
+                let result = push_until_not_aborted(
                     area,
                     cpu,
                     &mut head,
@@ -489,7 +512,7 @@ mod tests {
             // SAFETY: the handler has C ABI and remains valid for the process lifetime.
             unsafe {
                 let mut action: libc::sigaction = mem::zeroed();
-                action.sa_sigaction = ignore_signal as usize;
+                action.sa_sigaction = ignore_signal as *const () as usize;
                 action.sa_flags = libc::SA_RESTART;
                 libc::sigemptyset(&mut action.sa_mask);
                 assert_eq!(libc::sigaction(libc::SIGUSR1, &action, ptr::null_mut()), 0);
@@ -515,14 +538,18 @@ mod tests {
         let cpu = available_cpus()[0];
         let (tid_tx, tid_rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
+        let start = Arc::new(Barrier::new(2));
+        let writer_start = Arc::clone(&start);
         let writer = thread::spawn(move || {
             pin_to(cpu);
             let area = ThreadArea::current().expect("glibc did not register rseq");
             tid_tx.send(thread_id()).unwrap();
+            writer_start.wait();
             let max_len = 60_256;
             let mut payload = vec![0; max_len];
             let mut buffer = vec![0xaa; RING_SIZE + total(max_len)];
             let mut aborts = 0;
+            let mut done = 0;
 
             for attempt in 0..4_000_u64 {
                 let len = 60_000 + attempt as usize % 257;
@@ -544,6 +571,7 @@ mod tests {
                 };
                 match result {
                     Push::Done => {
+                        done += 1;
                         assert_eq!(head, total(len) as u64);
                         assert_eq!(
                             u64::from_ne_bytes(buffer[..8].try_into().unwrap()),
@@ -558,12 +586,13 @@ mod tests {
                     Push::Full => panic!("record unexpectedly did not fit"),
                 }
             }
-            aborts
+            (aborts, done)
         });
 
         let writer_tid = tid_rx.recv().unwrap();
         let signal_stop = Arc::clone(&stop);
         let signaler = thread::spawn(move || {
+            start.wait();
             while !signal_stop.load(Ordering::Acquire) {
                 if !send_signal(writer_tid) {
                     break;
@@ -571,10 +600,11 @@ mod tests {
             }
         });
 
-        let aborts = writer.join().unwrap();
+        let (aborts, done) = writer.join().unwrap();
         stop.store(true, Ordering::Release);
         signaler.join().unwrap();
         assert!(aborts > 0);
+        assert!(done > 0);
     }
 
     struct ConcurrentRing {
@@ -690,7 +720,9 @@ mod tests {
             }));
         }
         drop(tid_tx);
-        let writer_tids: Vec<_> = tid_rx.iter().collect();
+        let writer_tids: Vec<_> = (0..WRITERS)
+            .map(|_| tid_rx.recv().unwrap())
+            .collect();
         assert_eq!(writer_tids.len(), WRITERS);
 
         let consumer_ring = Arc::clone(&ring);
@@ -755,6 +787,107 @@ mod tests {
         signaler.join().unwrap();
 
         assert_eq!(consumed, counts);
+        assert!(counts.iter().all(|&count| count >= 1000));
         assert!(aborts.load(Ordering::Relaxed) > 0);
+    }
+
+    #[repr(C)]
+    struct RseqCs {
+        version: u32,
+        flags: u32,
+        start_ip: u64,
+        post_commit_offset: u64,
+        abort_ip: u64,
+    }
+
+    #[test]
+    fn descriptor_brackets_arming_and_commit() {
+        let (area, cpu) = pinned_area();
+        let payload = [0x5a; 8];
+        let mut buffer = vec![0xaa; RING_SIZE + total(payload.len())];
+        let mut descriptor_address = 0_u64;
+
+        for _ in 0..10_000 {
+            let mut head = 0;
+            // SAFETY: the test allocations cover the record and only this thread writes `head`.
+            let result = unsafe {
+                push_until_not_aborted(
+                    area,
+                    cpu,
+                    &mut head,
+                    &mut buffer,
+                    RING_SIZE as u64,
+                    payload.as_ptr(),
+                    payload.len(),
+                )
+            };
+            assert_eq!(result, Push::Done);
+            // SAFETY: offset 8 is the registered thread area's aligned `rseq_cs` field.
+            descriptor_address = unsafe { ptr::read_volatile(area.ptr.add(8).cast::<u64>()) };
+            if descriptor_address != 0 {
+                break;
+            }
+        }
+        assert_ne!(descriptor_address, 0);
+
+        // SAFETY: a nonzero `rseq_cs` value points to this call site's static descriptor.
+        let descriptor = unsafe { &*(descriptor_address as *const RseqCs) };
+        assert_eq!(descriptor.version, 0);
+        assert_eq!(descriptor.flags, 0);
+
+        // SAFETY: the descriptor points into this function's emitted instructions.
+        let signature = unsafe { ptr::read_unaligned((descriptor.abort_ip - 4) as *const u32) };
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            assert_eq!(signature, 0xd428bc00);
+            // SAFETY: the descriptor brackets aligned AArch64 instructions in this function.
+            let arming = unsafe { ptr::read_unaligned((descriptor.start_ip - 4) as *const u32) };
+            // SAFETY: the descriptor brackets aligned AArch64 instructions in this function.
+            let commit = unsafe {
+                ptr::read_unaligned(
+                    (descriptor.start_ip + descriptor.post_commit_offset - 4) as *const u32,
+                )
+            };
+            assert_eq!(arming & 0xffff_fc00, 0xf900_0400);
+            assert_eq!(commit & 0xffff_fc00, 0xc89f_fc00);
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert_eq!(signature, 0x53053053);
+            // SAFETY: the descriptor's start follows at least the five-byte arming instruction.
+            let arming = unsafe {
+                slice::from_raw_parts((descriptor.start_ip - 5) as *const u8, 5)
+            };
+            let arming_without_sib = arming[1] & 0xf8 == 0x48
+                && arming[2] == 0x89
+                && arming[3] & 0xc0 == 0x40
+                && arming[3] & 0x07 != 4
+                && arming[4] == 0x08;
+            let arming_with_sib = arming[0] & 0xf8 == 0x48
+                && arming[1] == 0x89
+                && arming[2] & 0xc7 == 0x44
+                && arming[3] == 0x24
+                && arming[4] == 0x08;
+            assert!(arming_without_sib || arming_with_sib);
+
+            let post_commit = descriptor.start_ip + descriptor.post_commit_offset;
+            // SAFETY: the post-commit address follows at least the four-byte commit instruction.
+            let commit = unsafe { slice::from_raw_parts((post_commit - 4) as *const u8, 4) };
+            let commit_without_suffix = commit[1] & 0xf8 == 0x48
+                && commit[2] == 0x89
+                && commit[3] & 0xc0 == 0
+                && !matches!(commit[3] & 0x07, 4 | 5);
+            let commit_with_sib = commit[0] & 0xf8 == 0x48
+                && commit[1] == 0x89
+                && commit[2] & 0xc7 == 0x04
+                && commit[3] == 0x24;
+            let commit_with_displacement = commit[0] & 0xf8 == 0x48
+                && commit[1] == 0x89
+                && commit[2] & 0xc7 == 0x45
+                && commit[3] == 0x00;
+            assert!(commit_without_suffix || commit_with_sib || commit_with_displacement);
+        }
     }
 }
