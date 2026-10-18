@@ -19,7 +19,7 @@ pub fn uid(stream: u64) -> u32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Control {
     Open { slot: u32, uid: u32 },
-    Close { slot: u32 },
+    Close { slot: u32, uid: u32 },
 }
 
 /// Polling thread to control thread: this stream stalled and was dropped.
