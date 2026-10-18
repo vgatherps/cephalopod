@@ -3,7 +3,7 @@
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use ceph_ring::{Config, PushError, Reader, Writer};
+use ceph_ring::{Config, PushError, Reader, Record, Writer};
 
 const KIB: usize = 1024;
 const CHILD_ENV: &str = "CEPH_RING_CHILD";
@@ -59,13 +59,15 @@ fn round_trip_and_wrap() {
     for &k in allowed_cpus().iter().take(2) {
         pin(&[k]);
         let (mut pushed, mut next) = (0, 0);
-        let mut check = |r: &[u8]| {
-            assert_eq!(r, indexed_record(next), "ring {k} record {next}");
+        let mut check = |r: Record<'_>| {
+            assert_eq!(r.stream, k as u64, "ring {k} record {next}");
+            assert_eq!(r.seq, next as u64, "ring {k} record {next}");
+            assert_eq!(r.payload, indexed_record(next), "ring {k} record {next}");
             next += 1;
             true
         };
         while pushed < 1000 {
-            match writer.try_push(&indexed_record(pushed)) {
+            match writer.try_push(&indexed_record(pushed), k as u64, pushed as u64) {
                 Ok(()) => pushed += 1,
                 Err(PushError::Full) => assert!(reader.read(k, &mut check) > 0),
                 Err(e) => panic!("{e:?}"),
@@ -86,7 +88,7 @@ fn round_trip_and_wrap() {
 #[test]
 fn full_boundary_and_oversize() {
     let p = prefix("full_boundary_and_oversize");
-    let max = 16 * KIB - 8;
+    let max = 16_344;
     let mut reader = Reader::create(
         &p,
         Config {
@@ -100,17 +102,47 @@ fn full_boundary_and_oversize() {
     pin(&[cpu]);
 
     let rec = [0x5a; 1000];
-    for _ in 0..16 {
-        assert_eq!(writer.try_push(&rec), Ok(()));
+    for seq in 0..15 {
+        assert_eq!(writer.try_push(&rec, 7, seq), Ok(()));
     }
-    assert_eq!(writer.try_push(&rec), Err(PushError::Full));
-    assert_eq!(reader.read(cpu, |r| r == rec), 16);
+    assert_eq!(writer.try_push(&rec, 7, 15), Err(PushError::Full));
+    let mut first = true;
+    assert_eq!(
+        reader.read(cpu, |r| {
+            if first {
+                first = false;
+                assert_eq!((r.stream, r.seq, r.payload), (7, 0, &rec[..]));
+                true
+            } else {
+                false
+            }
+        }),
+        1
+    );
+    assert_eq!(writer.try_push(&rec, 7, 15), Ok(()));
+    assert_eq!(
+        reader.read(cpu, |r| {
+            assert_eq!(r.stream, 7);
+            assert_eq!(r.payload, rec);
+            true
+        }),
+        15
+    );
 
     let big: Vec<u8> = (0..max).map(|j| (j * 13) as u8).collect();
-    assert_eq!(writer.try_push(&big), Ok(()));
-    assert_eq!(writer.try_push(&[]), Err(PushError::Full));
-    assert_eq!(writer.try_push(&vec![0; max + 1]), Err(PushError::TooLarge));
-    assert_eq!(reader.read(cpu, |r| r == big), 1);
+    assert_eq!(writer.try_push(&big, 8, 16), Ok(()));
+    assert_eq!(writer.try_push(&[], 8, 17), Err(PushError::Full));
+    assert_eq!(
+        writer.try_push(&vec![0; max + 1], 8, 17),
+        Err(PushError::TooLarge)
+    );
+    assert_eq!(
+        reader.read(cpu, |r| {
+            assert_eq!((r.stream, r.seq, r.payload), (8, 16, &big[..]));
+            true
+        }),
+        1
+    );
 }
 
 #[test]
@@ -127,33 +159,33 @@ fn stop_before() {
     let writer = Writer::attach(&p).unwrap();
     let cpu = allowed_cpus()[0];
     pin(&[cpu]);
-    for r in [&b"A"[..], b"BB", b"CCC"] {
-        writer.try_push(r).unwrap();
+    for (seq, r) in [&b"A"[..], b"BB", b"CCC"].into_iter().enumerate() {
+        writer.try_push(r, 9, seq as u64).unwrap();
     }
 
     let mut seen = Vec::new();
     let consumed = reader.read(cpu, |r| {
-        seen.push(r.to_vec());
-        r != b"BB"
+        assert_eq!(r.stream, 9);
+        seen.push((r.seq, r.payload.to_vec()));
+        r.payload != b"BB"
     });
     assert_eq!(consumed, 1);
-    assert_eq!(seen, [b"A".to_vec(), b"BB".to_vec()]);
+    assert_eq!(seen, [(0, b"A".to_vec()), (1, b"BB".to_vec())]);
 
     seen.clear();
     let consumed = reader.read(cpu, |r| {
-        seen.push(r.to_vec());
+        assert_eq!(r.stream, 9);
+        seen.push((r.seq, r.payload.to_vec()));
         true
     });
     assert_eq!(consumed, 2);
-    assert_eq!(seen, [b"BB".to_vec(), b"CCC".to_vec()]);
+    assert_eq!(seen, [(1, b"BB".to_vec()), (2, b"CCC".to_vec())]);
 }
 
 fn child_record(id: u32, index: u64) -> Vec<u8> {
-    let mut r = Vec::new();
-    r.extend(id.to_le_bytes());
-    r.extend(index.to_le_bytes());
-    r.extend((0..index % 200).map(|j| (id as u64 * 31 + index + j) as u8));
-    r
+    (0..index % 200)
+        .map(|j| (id as u64 * 31 + index + j) as u8)
+        .collect()
 }
 
 /// Child role of `multi_process`: writes indexes 0..`count`. All children share the first two
@@ -170,7 +202,7 @@ fn run_child(spec: &str) {
     let writer = Writer::attach(p).unwrap();
     let mut index = 0;
     while index < count {
-        match writer.try_push(&child_record(id, index)) {
+        match writer.try_push(&child_record(id, index), id as u64, index) {
             Ok(()) => index += 1,
             Err(PushError::Full) => std::thread::yield_now(),
             Err(e) => panic!("{e:?}"),
@@ -181,9 +213,13 @@ fn run_child(spec: &str) {
 fn drain(reader: &mut Reader, seen: &mut [Vec<u64>]) {
     for ring in 0..reader.nr_rings() {
         reader.read(ring, |r| {
-            let id = u32::from_le_bytes(r[..4].try_into().unwrap());
-            let index = u64::from_le_bytes(r[4..12].try_into().unwrap());
-            assert_eq!(r, child_record(id, index), "child {id} index {index}");
+            let id = u32::try_from(r.stream).unwrap();
+            let index = r.seq;
+            assert_eq!(
+                r.payload,
+                child_record(id, index),
+                "child {id} index {index}"
+            );
             seen[id as usize].push(index);
             true
         });
@@ -249,13 +285,19 @@ fn stale_object() {
     let cpu = allowed_cpus()[0];
     pin(&[cpu]);
     let stale = Reader::create(&p, cfg()).unwrap();
-    Writer::attach(&p).unwrap().try_push(b"stale").unwrap();
+    Writer::attach(&p)
+        .unwrap()
+        .try_push(b"stale", 1, 0)
+        .unwrap();
     std::mem::forget(stale);
 
     let mut reader = Reader::create(&p, cfg()).unwrap();
-    Writer::attach(&p).unwrap().try_push(b"fresh").unwrap();
+    Writer::attach(&p)
+        .unwrap()
+        .try_push(b"fresh", 2, 0)
+        .unwrap();
     let consumed = reader.read(cpu, |r| {
-        assert_eq!(r, b"fresh");
+        assert_eq!((r.stream, r.seq, r.payload), (2, 0, &b"fresh"[..]));
         true
     });
     assert_eq!(consumed, 1);

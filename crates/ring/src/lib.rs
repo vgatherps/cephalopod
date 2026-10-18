@@ -6,11 +6,14 @@ use std::slice;
 use std::sync::atomic::Ordering::{Acquire, Release};
 use std::sync::atomic::{AtomicU32, AtomicU64};
 
+use ceph_rseq::{
+    LEN_OFFSET, Private, SEQ_OFFSET, STREAM_OFFSET, TAG_OFFSET, record_total, tag_for,
+};
 #[cfg(target_os = "linux")]
 use ceph_rseq::{Push, ThreadArea, push_record};
 
 const MAGIC: u64 = u64::from_le_bytes(*b"cephring");
-const LINES_OFFSET: usize = 4096;
+const TAILS_OFFSET: usize = 4096;
 
 #[repr(C)]
 struct Header {
@@ -18,12 +21,6 @@ struct Header {
     nr_rings: u64,
     ring_size: u64,
     max_record: u64,
-}
-
-#[repr(C, align(128))]
-struct Line {
-    value: AtomicU64,
-    /// Off Linux, the push spinlock of a head line. Kept on Linux so the layout matches.
     #[cfg_attr(target_os = "linux", allow(dead_code))]
     lock: AtomicU32,
 }
@@ -92,20 +89,25 @@ impl Map {
         Ok(map)
     }
 
-    /// Ring `i`'s base address, head, and tail. Panics if `i` is not a ring.
-    fn ring(&self, i: usize) -> (*mut u8, &AtomicU64, &AtomicU64) {
+    /// Ring `i`'s base address, private line, and consumer tail. Panics if `i` is not a ring.
+    fn ring(&self, i: usize) -> (*mut u8, &Private, &AtomicU64) {
         let base = self.rings[i];
-        // SAFETY: `nr_rings` heads then `nr_rings` tails start at LINES_OFFSET inside `meta`.
-        let line =
-            |j: usize| unsafe { &(*self.meta.add(LINES_OFFSET).cast::<Line>().add(j)).value };
-        (base, line(i), line(self.rings.len() + i))
+        // SAFETY: the compact tails and aligned private lines are inside the metadata mapping.
+        let tail = unsafe { &*self.meta.add(TAILS_OFFSET).cast::<AtomicU64>().add(i) };
+        let private = unsafe {
+            &*self
+                .meta
+                .add(private_offset(self.rings.len()))
+                .cast::<Private>()
+                .add(i)
+        };
+        (base, private, tail)
     }
 
-    /// Ring 0's push spinlock, in its head line.
     #[cfg(not(target_os = "linux"))]
     fn lock(&self) -> &AtomicU32 {
-        // SAFETY: ring 0's head is the first line at LINES_OFFSET inside `meta`.
-        unsafe { &(*self.meta.add(LINES_OFFSET).cast::<Line>()).lock }
+        // SAFETY: `Header` starts at the beginning of the metadata mapping.
+        unsafe { &(*self.meta.cast::<Header>()).lock }
     }
 }
 
@@ -129,6 +131,12 @@ pub struct Reader {
     tails: Vec<u64>,
 }
 
+pub struct Record<'a> {
+    pub stream: u64,
+    pub seq: u64,
+    pub payload: &'a [u8],
+}
+
 impl Reader {
     pub fn create(prefix: &str, cfg: Config) -> io::Result<Reader> {
         let Config {
@@ -140,8 +148,11 @@ impl Reader {
             "ring_size {ring_size} must be a power of two and a multiple of the page size"
         );
         assert!(
-            max_record.checked_add(8).is_some_and(|n| n <= ring_size),
-            "max_record {max_record} + 8 exceeds ring_size {ring_size}"
+            u64::try_from(max_record)
+                .ok()
+                .and_then(|n| record_total(n).checked_add(8))
+                .is_some_and(|n| n <= ring_size as u64),
+            "record_total({max_record}) + 8 exceeds ring_size {ring_size}"
         );
         #[cfg(target_os = "linux")]
         let nr_rings = possible_cpus()?;
@@ -178,32 +189,37 @@ impl Reader {
         self.tails.len()
     }
 
-    /// Visits records of `ring` from the local tail up to the head loaded with Acquire. Stops
-    /// before the first record for which `f` returns false and leaves it in the ring. Stores the
-    /// new tail with Release once at the end if it moved. Returns the number of records consumed.
-    pub fn read(&mut self, ring: usize, mut f: impl FnMut(&[u8]) -> bool) -> usize {
-        let (base, head, shared_tail) = self.map.ring(ring);
-        let head = head.load(Acquire);
+    /// Visits committed records in `ring`. Stops before the first record for which `f` returns
+    /// false and leaves it in the ring. Returns the number of records consumed.
+    pub fn read(&mut self, ring: usize, mut f: impl FnMut(Record<'_>) -> bool) -> usize {
+        let (base, _, shared_tail) = self.map.ring(ring);
         let mask = self.map.ring_size as u64 - 1;
         let mut tail = self.tails[ring];
         let mut consumed = 0;
-        while tail < head {
-            // SAFETY: [tail, head) holds committed records that producers do not touch until the
-            // tail passes them. A record starts 8-aligned below `ring_size`, and its length is
-            // checked against `max_record` (<= ring_size - 8), so it ends inside the double mapping.
+        loop {
+            // SAFETY: record starts are 8-aligned and the ring is mapped twice contiguously.
             let record = unsafe {
                 let start = base.add((tail & mask) as usize);
-                let len = start.cast::<u64>().read() as usize;
+                let tag = (&*start.add(TAG_OFFSET).cast::<AtomicU64>()).load(Acquire);
+                if tag != tag_for(tail) {
+                    break;
+                }
+                let len = start.add(LEN_OFFSET).cast::<u64>().read() as usize;
                 assert!(
                     len <= self.max_record,
                     "ring {ring}: record length {len} at {tail}"
                 );
-                slice::from_raw_parts(start.add(8), len)
+                Record {
+                    stream: start.add(STREAM_OFFSET).cast::<u64>().read(),
+                    seq: start.add(SEQ_OFFSET).cast::<u64>().read(),
+                    payload: slice::from_raw_parts(start.add(ceph_rseq::HEADER_LEN as usize), len),
+                }
             };
+            let total = record_total(record.payload.len() as u64);
             if !f(record) {
                 break;
             }
-            tail += 8 + record.len().next_multiple_of(8) as u64;
+            tail += total;
             consumed += 1;
         }
         if tail != self.tails[ring] {
@@ -283,47 +299,53 @@ impl Writer {
         })
     }
 
-    pub fn try_push(&self, record: &[u8]) -> Result<(), PushError> {
-        if record.len() > self.max_record {
+    pub fn try_push(&self, payload: &[u8], stream: u64, seq: u64) -> Result<(), PushError> {
+        if payload.len() > self.max_record {
             return Err(PushError::TooLarge);
         }
-        self.push(record)
+        self.push(payload, stream, seq)
     }
 
     #[cfg(target_os = "linux")]
-    fn push(&self, record: &[u8]) -> Result<(), PushError> {
+    fn push(&self, payload: &[u8], stream: u64, seq: u64) -> Result<(), PushError> {
         let ring_size = self.map.ring_size as u64;
-        let area = ThreadArea::current().expect("attach checked that rseq is registered");
+        let mut refreshed = None;
         loop {
+            let area = ThreadArea::current().expect("attach checked that rseq is registered");
             let cpu = area.cpu_id_start();
-            let (base, head, tail) = self.map.ring(cpu as usize);
-            let limit = tail.load(Acquire) + ring_size;
-            // SAFETY: `head` is 128-aligned and written only by push_record on `cpu` (it aborts
-            // when the thread is elsewhere). `base` is ring `cpu` mapped twice, and a record takes
-            // 8 + round_up(len, 8) bytes, at most ring_size: ring_size - 8 is a multiple of 8 and
-            // max_record + 8 <= ring_size.
+            let (base, private, tail) = self.map.ring(cpu as usize);
+            // SAFETY: `private` is CPU `cpu`'s aligned private line, `base` is its double-mapped
+            // ring, and create ensures the record plus its following tag word fit in the mapping.
             let push = unsafe {
                 push_record(
                     area,
                     cpu,
-                    head.as_ptr(),
+                    private,
                     base,
-                    ring_size - 1,
-                    limit,
-                    record.as_ptr(),
-                    record.len() as u64,
+                    ring_size,
+                    payload.as_ptr(),
+                    payload.len() as u64,
+                    stream,
+                    seq,
                 )
             };
             match push {
                 Push::Done => return Ok(()),
-                Push::Full => return Err(PushError::Full),
-                Push::Aborted => {}
+                Push::Aborted => refreshed = None,
+                Push::Full => {
+                    if refreshed == Some(cpu) {
+                        return Err(PushError::Full);
+                    }
+                    // Use the same CPU for both accesses; migration can only cause another refresh.
+                    private.tail.store(tail.load(Acquire), Release);
+                    refreshed = Some(cpu);
+                }
             }
         }
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn push(&self, record: &[u8]) -> Result<(), PushError> {
+    fn push(&self, payload: &[u8], stream: u64, seq: u64) -> Result<(), PushError> {
         use std::sync::atomic::Ordering::Relaxed;
 
         static WARN: std::sync::Once = std::sync::Once::new();
@@ -334,27 +356,48 @@ impl Writer {
             )
         });
         let ring_size = self.map.ring_size as u64;
-        let (base, head, tail) = self.map.ring(0);
+        let (base, private, tail) = self.map.ring(0);
         let lock = self.map.lock();
         while lock.compare_exchange(0, 1, Acquire, Relaxed).is_err() {
             std::hint::spin_loop();
         }
-        // The lock's Acquire orders this after the previous holder's head store.
-        let at = head.load(Relaxed);
-        let len = record.len() as u64;
-        let end = at + 8 + len.next_multiple_of(8);
-        let result = if end > tail.load(Acquire) + ring_size {
+        let mask = ring_size - 1;
+        let mut at = private.head.load(Relaxed);
+        loop {
+            // SAFETY: `at` is 8-aligned and `base` is ring 0 mapped twice.
+            let start = unsafe { base.add((at & mask) as usize) };
+            // SAFETY: record tags are aligned AtomicU64 values in the shared ring.
+            let tag = unsafe { &*start.add(TAG_OFFSET).cast::<AtomicU64>() }.load(Acquire);
+            if tag != tag_for(at) {
+                break;
+            }
+            // SAFETY: acquiring the committed tag makes the record header visible.
+            let len = unsafe { start.add(LEN_OFFSET).cast::<u64>().read() };
+            at += record_total(len);
+        }
+        let total = record_total(payload.len() as u64);
+        let result = if at + total + 8 > tail.load(Acquire) + ring_size {
             Err(PushError::Full)
         } else {
-            // SAFETY: `at` is 8-aligned and `base` is ring 0 mapped twice, so the 8 + len bytes
-            // (len <= max_record <= ring_size - 8) are contiguous. The reader is done with them
-            // (`end` <= tail + ring_size) and other writers wait on the lock.
+            private.head.store(at, Relaxed);
+            // SAFETY: create ensures this record and the following tag word fit in the double
+            // mapping. The consumer has released the space, and other writers hold the lock.
             unsafe {
-                let start = base.add((at & (ring_size - 1)) as usize);
-                start.cast::<u64>().write(len);
-                ptr::copy_nonoverlapping(record.as_ptr(), start.add(8), record.len());
+                let start = base.add((at & mask) as usize);
+                (&*start.add(total as usize).cast::<AtomicU64>()).store(0, Relaxed);
+                start
+                    .add(LEN_OFFSET)
+                    .cast::<u64>()
+                    .write(payload.len() as u64);
+                start.add(STREAM_OFFSET).cast::<u64>().write(stream);
+                start.add(SEQ_OFFSET).cast::<u64>().write(seq);
+                ptr::copy_nonoverlapping(
+                    payload.as_ptr(),
+                    start.add(ceph_rseq::HEADER_LEN as usize),
+                    payload.len(),
+                );
+                (&*start.add(TAG_OFFSET).cast::<AtomicU64>()).store(tag_for(at), Release);
             }
-            head.store(end, Release);
             Ok(())
         };
         lock.store(0, Release);
@@ -368,7 +411,11 @@ fn page_size() -> usize {
 }
 
 fn meta_bytes(nr_rings: usize) -> usize {
-    (LINES_OFFSET + 2 * nr_rings * size_of::<Line>()).next_multiple_of(page_size())
+    (private_offset(nr_rings) + nr_rings * size_of::<Private>()).next_multiple_of(page_size())
+}
+
+fn private_offset(nr_rings: usize) -> usize {
+    (TAILS_OFFSET + nr_rings * size_of::<AtomicU64>()).next_multiple_of(align_of::<Private>())
 }
 
 /// Max id in the possible-CPU list, plus one.

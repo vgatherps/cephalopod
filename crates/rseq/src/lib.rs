@@ -1,11 +1,14 @@
-#![cfg(target_os = "linux")]
-
-#[cfg(not(target_env = "gnu"))]
+#[cfg(all(target_os = "linux", not(target_env = "gnu")))]
 compile_error!("ceph-rseq requires the GNU libc environment");
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(all(
+    target_os = "linux",
+    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
 compile_error!("ceph-rseq requires x86_64 or aarch64");
 
+#[cfg(target_os = "linux")]
 use std::arch::asm;
+#[cfg(target_os = "linux")]
 use std::ptr;
 use std::sync::atomic::AtomicU64;
 
@@ -38,23 +41,27 @@ pub struct Private {
     pub tail: AtomicU64,
 }
 
+#[cfg(target_os = "linux")]
 unsafe extern "C" {
     static __rseq_offset: isize;
     static __rseq_size: u32;
 }
 
 /// Returns whether glibc registered an rseq area for this process's threads.
+#[cfg(target_os = "linux")]
 pub fn registered() -> bool {
     // SAFETY: glibc exports this process-wide value for the life of the process.
     unsafe { ptr::read_volatile(ptr::addr_of!(__rseq_size)) != 0 }
 }
 
 /// The calling thread's `struct rseq`. This value is neither `Send` nor `Sync`.
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy)]
 pub struct ThreadArea {
     ptr: *mut u8,
 }
 
+#[cfg(target_os = "linux")]
 impl ThreadArea {
     /// Returns this thread's rseq area, or `None` when glibc did not register it.
     pub fn current() -> Option<ThreadArea> {
@@ -95,6 +102,7 @@ impl ThreadArea {
 }
 
 /// Outcome of one [`push_record`] attempt.
+#[cfg(target_os = "linux")]
 #[derive(Debug, PartialEq, Eq)]
 pub enum Push {
     /// The record is committed in the ring.
@@ -160,6 +168,7 @@ pub enum Push {
 /// Neither the destination record nor the cleared word after it may overlap `private`. Positions
 /// and their additions must not wrap. `src` must be readable for `len` bytes and must not overlap
 /// the destination record or `private`.
+#[cfg(target_os = "linux")]
 pub unsafe fn push_record(
     area: ThreadArea,
     cpu: u32,
@@ -473,7 +482,7 @@ pub unsafe fn push_record(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use std::mem;
