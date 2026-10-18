@@ -1,0 +1,10 @@
+[package]
+name = "ceph-rseq"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "ceph_rseq"
+
+[dev-dependencies]
+libc.workspace = true
