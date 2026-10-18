@@ -1,0 +1,12 @@
+[package]
+name = "ceph-control"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "ceph_control"
+
+[dependencies]
+ceph-proto.workspace = true
+libc.workspace = true
+
