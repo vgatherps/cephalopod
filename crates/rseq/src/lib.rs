@@ -7,6 +7,34 @@ compile_error!("ceph-rseq requires x86_64 or aarch64");
 
 use std::arch::asm;
 use std::ptr;
+use std::sync::atomic::AtomicU64;
+
+/// Record header, 32 bytes, 8-aligned, followed by the payload padded to 8.
+pub const HEADER_LEN: u64 = 32;
+pub const TAG_OFFSET: usize = 0;
+pub const LEN_OFFSET: usize = 8;
+pub const STREAM_OFFSET: usize = 16;
+pub const SEQ_OFFSET: usize = 24;
+
+/// Bytes a record with `len` payload bytes occupies: 32 + round_up(len, 8).
+pub const fn record_total(len: u64) -> u64 {
+    (len + 39) & !7
+}
+
+/// The tag a committed record at `pos` carries.
+pub const fn tag_for(pos: u64) -> u64 {
+    pos | 1
+}
+
+/// One CPU's private cached head and consumer tail.
+///
+/// `head` is only touched inside [`push_record`]. `tail` is read inside `push_record` and
+/// written by the caller on refresh with a Release store.
+#[repr(C, align(128))]
+pub struct Private {
+    pub head: AtomicU64,
+    pub tail: AtomicU64,
+}
 
 unsafe extern "C" {
     static __rseq_offset: isize;
@@ -67,21 +95,21 @@ impl ThreadArea {
 /// Outcome of one [`push_record`] attempt.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Push {
-    /// The record is in the ring and `*head` points past it.
+    /// The record is committed in the ring.
     Done,
-    /// The record does not fit below `limit`. Nothing was written.
+    /// The record does not fit below the cached tail plus the ring size. Nothing was written.
     Full,
     /// The attempt was cut short: the thread was not on `cpu`, or it was preempted, migrated, or
-    /// signalled before the head store. `*head` is unchanged; bytes past it may be partly
-    /// written. Retry.
+    /// signalled before the tag store. The private head and record bytes may be partly written.
+    /// Retry.
     Aborted,
 }
 
 /// Appends one record to `cpu`'s ring inside one rseq critical section.
 ///
-/// The record goes at `base + (*head & mask)`: the payload length as a u64, the `len` payload
-/// bytes, then padding up to a multiple of 8 (padding is not written). `*head` advances by
-/// `(len + 15) & !7`.
+/// The record goes at `base + (pos & (ring_size - 1))`. Its 32-byte header contains the
+/// position tag, payload length, stream, and sequence number, followed by `len` payload bytes
+/// and unwritten padding to a multiple of 8.
 ///
 /// How the critical section works:
 ///
@@ -94,11 +122,11 @@ pub enum Push {
 ///    preemption there would make the kernel clear `rseq_cs` (the instruction pointer is outside
 ///    the range) and the section would run unprotected.
 /// 4. The section first checks `rseq->cpu_id == cpu`, so a thread only writes the ring of the CPU
-///    it is on. Any other thread that gets this CPU before our head store aborts us first, so each
-///    ring has exactly one writer at a time and no atomic read-modify-write is needed.
-/// 5. It checks for room, writes the header and payload, then stores the new head. That store is
-///    the commit and the last instruction of the section: before it the consumer sees nothing,
-///    after it the consumer sees the whole record.
+///    it is on. It walks past the record at the cached head when that record is committed, then
+///    checks the cached tail for room and stores the chosen record base back to the private head.
+/// 5. It writes the length, stream, sequence number, and payload, then stores the position tag.
+///    The tag store is the commit and the last instruction of the section: before it the consumer
+///    sees no record at this position, after it the consumer sees the whole record.
 /// 6. The kernel only jumps to an abort handler preceded by the 4-byte signature glibc registered
 ///    (`RSEQ_SIG`).
 ///
@@ -108,7 +136,9 @@ pub enum Push {
 /// |---|---|
 /// | 20 | the `struct rseq_cs` descriptor (in `__rseq_cs`) |
 /// | 30 | start of the critical section |
-/// | 40 | end of the critical section, right after the head store |
+/// | 40 | end of the critical section, right after the tag store |
+/// | 50 | cached-head walk loop |
+/// | 51 | cached-head walk exit |
 /// | 52 | aarch64 payload-copy join and commit |
 /// | 53 | aarch64 32-byte copy loop and trailing overlapping copy |
 /// | 54, 55, 56, 57, 58 | aarch64 copy cases for 16-31, 8-15, 4-7, 2-3, and 0-1 bytes |
@@ -118,68 +148,115 @@ pub enum Push {
 ///
 /// # Safety
 ///
-/// `head` must be 8-aligned and only written through this function by threads running on `cpu`.
-/// `base + (*head & mask)` must be writable for `8 + round_up(len, 8)` bytes. `limit` must equal
-/// a tail loaded with `Acquire` plus the ring size. A stale tail is safe because tail only grows.
-/// Positions and their additions must not wrap. `src` must be readable for `len` bytes and must
-/// not overlap the destination record or `*head`. The destination record must not overlap `*head`.
+/// `private` must point to a live, aligned `Private` for `cpu`. Its head must only be accessed by
+/// this function from threads running on `cpu`; its tail must contain a value loaded from the
+/// consumer tail with Acquire and stored with Release. `ring_size` must be a nonzero power of two.
+/// `base + (pos & (ring_size - 1))` must be writable for [`record_total(len)`] bytes. Positions
+/// and their additions must not wrap. `src` must be readable for `len` bytes and must not overlap
+/// the destination record or `private`.
 pub unsafe fn push_record(
     area: ThreadArea,
     cpu: u32,
-    head: *mut u64,
+    private: *const Private,
     base: *mut u8,
-    mask: u64,
-    limit: u64,
+    ring_size: u64,
     src: *const u8,
     len: u64,
+    stream: u64,
+    seq: u64,
 ) -> Push {
+    #[cfg(target_arch = "x86_64")]
+    #[repr(C)]
+    struct X86Args {
+        base: *mut u8,
+        ring_size: u64,
+        stream: u64,
+        seq: u64,
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    let args = X86Args {
+        base,
+        ring_size,
+        stream,
+        seq,
+    };
     let result: u64;
 
     // SAFETY: the caller provides the memory and per-CPU writer guarantees documented above.
     unsafe {
         // x86_64. `rep movsb` copies rcx bytes from rsi to rdi, so those three registers are fixed
         // (Rust does not allow names on fixed registers):
-        //   rdi: the head position, then the destination cursor
+        //   rdi: the record address, then the destination cursor
         //   rsi: the source cursor, starts at `src`
         //   rcx: bytes left to copy, starts at `len`
         #[cfg(target_arch = "x86_64")]
         asm!(
-            // Step 1: descriptor = { version 0, flags 0, start, length, abort handler }.
+            // Emit descriptor = { version 0, flags 0, start, length, abort handler }.
             ".pushsection __rseq_cs, \"aw\"",
             ".balign 32",
             "20:",
             ".long 0, 0",
             ".quad 30f, 40f - 30f, 60f",
             ".popsection",
-            // Steps 2-3: rseq->rseq_cs (offset 8) = &descriptor, immediately before the start.
+            // Arm rseq->rseq_cs immediately before the start label.
             "leaq 20b(%rip), {desc}",
             "movq {desc}, 8({rseq})",
             "30:",
-            // Step 4: abort unless rseq->cpu_id (offset 4) is `cpu`.
+            // Abort unless rseq->cpu_id (offset 4) is `cpu`.
             "cmpl {cpu:e}, 4({rseq})",
             "jne 60f",
-            // Step 5a: new_head = head + ((len + 15) & !7), the header plus the padded payload.
-            "movq ({head}), %rdi",
-            "leaq 15(%rcx), {new_head}",
-            "andq $-8, {new_head}",
-            "addq %rdi, {new_head}",
-            // Step 5b: full if the record would end past the consumer's tail plus the ring size.
-            "cmpq {limit}, {new_head}",
+            // Step 1: start at the cached head.
+            "movq ({private}), {cur}",
+            // Step 2: walk past every committed record at the cached head.
+            "50:",
+            "movq {cur}, %rdi",
+            "movq 8({args}), {calc}",
+            "decq {calc}",
+            "andq {calc}, %rdi",
+            "addq ({args}), %rdi",
+            "movq {cur}, {calc}",
+            "orq $1, {calc}",
+            "cmpq {calc}, (%rdi)",
+            "jne 51f",
+            "movq 8(%rdi), {calc}",
+            "addq $39, {calc}",
+            "andq $-8, {calc}",
+            "addq {calc}, {cur}",
+            "jmp 50b",
+            "51:",
+            // Step 3: full if this record would end past cached tail plus ring size.
+            "leaq 39(%rcx), {calc}",
+            "andq $-8, {calc}",
+            "addq {cur}, {calc}",
+            "movq 8({private}), {tag_ptr}",
+            "addq 8({args}), {tag_ptr}",
+            "cmpq {tag_ptr}, {calc}",
             "ja 70f",
-            // Step 5c: rdi = ring_base + (head & mask), where the record starts. Write the header.
-            "andq {mask}, %rdi",
-            "addq {ring_base}, %rdi",
-            "movq %rcx, (%rdi)",
-            "addq $8, %rdi",
-            // Step 5d: copy the payload. String stores are not reordered with the later head
-            // store (Intel SDM Vol. 3A 8.2.4.1), and the copy is interruptible.
+            // Step 4: cache this record's base before writing it.
+            "movq {cur}, ({private})",
+            // Step 5: find the record and write every header field except the tag.
+            "movq {cur}, %rdi",
+            "movq 8({args}), {calc}",
+            "decq {calc}",
+            "andq {calc}, %rdi",
+            "addq ({args}), %rdi",
+            "movq %rdi, {tag_ptr}",
+            "movq %rcx, 8(%rdi)",
+            "movq 16({args}), {calc}",
+            "movq {calc}, 16(%rdi)",
+            "movq 24({args}), {calc}",
+            "movq {calc}, 24(%rdi)",
+            "addq $32, %rdi",
+            // The copy is interruptible and string stores stay ordered before the tag store.
             "rep movsb",
-            // Step 5e: commit. Publish the new head; last instruction of the section.
-            "movq {new_head}, ({head})",
+            // Step 6: commit with the position tag; last instruction of the section.
+            "orq $1, {cur}",
+            "movq {cur}, ({tag_ptr})",
             "40:",
             "movq $0, {result}",
             "jmp 90f",
-            // Step 6: RSEQ_SIG 0x53053053, written as the tail of a `ud1` instruction so
+            // RSEQ_SIG 0x53053053 is the tail of a `ud1` instruction so
             // disassemblers stay in sync. The kernel reads the 4 bytes before label 60.
             ".byte 0x0f, 0xb9, 0x3d",
             ".long 0x53053053",
@@ -191,15 +268,15 @@ pub unsafe fn push_record(
             "90:",
             rseq = in(reg) area.ptr,
             cpu = in(reg) cpu,
-            head = in(reg) head,
-            ring_base = in(reg) base,
-            mask = in(reg) mask,
-            limit = in(reg) limit,
+            private = in(reg) private,
+            args = in(reg) &args,
             inout("rsi") src => _,
             inout("rcx") len => _,
             out("rdi") _,
             desc = out(reg) _,
-            new_head = out(reg) _,
+            cur = out(reg) _,
+            calc = out(reg) _,
+            tag_ptr = out(reg) _,
             result = lateout(reg) result,
             options(att_syntax, nostack),
         );
@@ -211,40 +288,64 @@ pub unsafe fn push_record(
         //   qa, qb (NEON), ra, rb (general): values in flight
         #[cfg(target_arch = "aarch64")]
         asm!(
-            // Step 1: descriptor = { version 0, flags 0, start, length, abort handler }.
+            // Emit descriptor = { version 0, flags 0, start, length, abort handler }.
             ".pushsection __rseq_cs, \"aw\"",
             ".balign 32",
             "20:",
             ".long 0, 0",
             ".quad 30f, 40f - 30f, 60f",
             ".popsection",
-            // Steps 2-3: rseq->rseq_cs (offset 8) = &descriptor, immediately before the start.
+            // Arm rseq->rseq_cs immediately before the start label.
             // adrp + add reaches the descriptor wherever the linker places __rseq_cs.
             "adrp {desc}, 20b",
             "add {desc}, {desc}, :lo12:20b",
             "str {desc}, [{rseq}, #8]",
             "30:",
-            // Step 4: abort unless rseq->cpu_id (offset 4) is `cpu`.
+            // Abort unless rseq->cpu_id (offset 4) is `cpu`.
             "ldr {cpu_now:w}, [{rseq}, #4]",
             "cmp {cpu_now:w}, {cpu:w}",
             "b.ne 60f",
-            // Step 5a: new_head = pos + ((len + 15) & !7), the header plus the padded payload.
-            "ldr {pos}, [{head}]",
-            "add {new_head}, {left}, #15",
-            "and {new_head}, {new_head}, #-8",
-            "add {new_head}, {pos}, {new_head}",
-            // Step 5b: full if the record would end past the consumer's tail plus the ring size.
-            "cmp {new_head}, {limit}",
-            "b.hi 70f",
-            // Step 5c: dst = ring_base + (pos & mask), where the record starts. Write the header.
-            "and {dst}, {pos}, {mask}",
+            // Step 1: start at the cached head.
+            "ldr {cur}, [{private}]",
+            // Step 2: walk past every committed record at the cached head.
+            "50:",
+            "sub {calc}, {ring_size}, #1",
+            "and {dst}, {cur}, {calc}",
             "add {dst}, {ring_base}, {dst}",
-            "str {left}, [{dst}], #8",
+            "orr {ra}, {cur}, #1",
+            "ldr {rb}, [{dst}]",
+            "cmp {rb}, {ra}",
+            "b.ne 51f",
+            "ldr {calc}, [{dst}, #8]",
+            "add {calc}, {calc}, #39",
+            "and {calc}, {calc}, #-8",
+            "add {cur}, {cur}, {calc}",
+            "b 50b",
+            "51:",
+            // Step 3: full if this record would end past cached tail plus ring size.
+            "add {calc}, {left}, #39",
+            "and {calc}, {calc}, #-8",
+            "add {calc}, {cur}, {calc}",
+            "ldr {ra}, [{private}, #8]",
+            "add {ra}, {ra}, {ring_size}",
+            "cmp {calc}, {ra}",
+            "b.hi 70f",
+            // Step 4: cache this record's base before writing it.
+            "str {cur}, [{private}]",
+            // Step 5: find the record and write every header field except the tag.
+            "sub {calc}, {ring_size}, #1",
+            "and {dst}, {cur}, {calc}",
+            "add {dst}, {ring_base}, {dst}",
+            "mov {tag_ptr}, {dst}",
+            "str {left}, [{dst}, #8]",
+            "str {stream}, [{dst}, #16]",
+            "str {seq}, [{dst}, #24]",
+            "add {dst}, {dst}, #32",
             "add {src_end}, {src}, {left}",
             "add {dst_end}, {dst}, {left}",
             "cmp {left}, #32",
             "b.lo 54f",
-            // Step 5d: lengths of at least 32 load full remaining blocks; the trailing load ends
+            // Step 5: lengths of at least 32 load full remaining blocks; the trailing load ends
             // at `src_end`, so no load passes it.
             "53:",
             "ldp {qa:q}, {qb:q}, [{src}], #32",
@@ -256,7 +357,7 @@ pub unsafe fn push_record(
             "ldp {qa:q}, {qb:q}, [{src_end}, #-32]",
             "stp {qa:q}, {qb:q}, [{dst_end}, #-32]",
             "b 52f",
-            // Step 5d: lengths 16 through 31 load at the start and ending at `src_end`, so no
+            // Step 5: lengths 16 through 31 load at the start and ending at `src_end`, so no
             // load passes it.
             "54:",
             "cmp {left}, #16",
@@ -266,7 +367,7 @@ pub unsafe fn push_record(
             "str {qa:q}, [{dst}]",
             "str {qb:q}, [{dst_end}, #-16]",
             "b 52f",
-            // Step 5d: lengths 8 through 15 load at the start and ending at `src_end`, so no
+            // Step 5: lengths 8 through 15 load at the start and ending at `src_end`, so no
             // load passes it.
             "55:",
             "cmp {left}, #8",
@@ -276,7 +377,7 @@ pub unsafe fn push_record(
             "str {ra}, [{dst}]",
             "str {rb}, [{dst_end}, #-8]",
             "b 52f",
-            // Step 5d: lengths 4 through 7 load at the start and ending at `src_end`, so no load
+            // Step 5: lengths 4 through 7 load at the start and ending at `src_end`, so no load
             // passes it.
             "56:",
             "cmp {left}, #4",
@@ -286,7 +387,7 @@ pub unsafe fn push_record(
             "str {ra:w}, [{dst}]",
             "str {rb:w}, [{dst_end}, #-4]",
             "b 52f",
-            // Step 5d: lengths 2 and 3 load at the start and ending at `src_end`, so no load
+            // Step 5: lengths 2 and 3 load at the start and ending at `src_end`, so no load
             // passes it.
             "57:",
             "cmp {left}, #2",
@@ -296,20 +397,20 @@ pub unsafe fn push_record(
             "strh {ra:w}, [{dst}]",
             "strh {rb:w}, [{dst_end}, #-2]",
             "b 52f",
-            // Step 5d: length 1 copies one byte; length 0 copies nothing. Neither passes
+            // Step 5: length 1 copies one byte; length 0 copies nothing. Neither passes
             // `src_end`. Both fall through to the commit.
             "58:",
             "cbz {left}, 52f",
             "ldrb {ra:w}, [{src}]",
             "strb {ra:w}, [{dst}]",
-            // Step 5e: commit. Store-release of the new head orders it after the payload stores;
-            // last instruction of the section.
+            // Step 6: commit. Store-release of the tag orders it after the record stores.
             "52:",
-            "stlr {new_head}, [{head}]",
+            "orr {cur}, {cur}, #1",
+            "stlr {cur}, [{tag_ptr}]",
             "40:",
             "mov {result}, #0",
             "b 90f",
-            // Step 6: RSEQ_SIG, the `brk #0x45e0` instruction. The kernel reads the 4 bytes
+            // RSEQ_SIG is the `brk #0x45e0` instruction. The kernel reads the 4 bytes
             // before label 60.
             ".inst 0xd428bc00",
             "60:",
@@ -320,17 +421,19 @@ pub unsafe fn push_record(
             "90:",
             rseq = in(reg) area.ptr,
             cpu = in(reg) cpu,
-            head = in(reg) head,
+            private = in(reg) private,
             ring_base = in(reg) base,
-            mask = in(reg) mask,
-            limit = in(reg) limit,
+            ring_size = in(reg) ring_size,
+            stream = in(reg) stream,
+            seq = in(reg) seq,
             src = inout(reg) src => _,
             left = inout(reg) len => _,
             desc = out(reg) _,
             cpu_now = out(reg) _,
-            pos = out(reg) _,
-            new_head = out(reg) _,
+            cur = out(reg) _,
+            calc = out(reg) _,
             dst = out(reg) _,
+            tag_ptr = out(reg) _,
             src_end = out(reg) _,
             dst_end = out(reg) _,
             qa = out(vreg) _,
@@ -354,7 +457,7 @@ mod tests {
     use super::*;
     use std::mem;
     use std::slice;
-    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{mpsc, Barrier};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -396,9 +499,23 @@ mod tests {
         (area, cpu as u32)
     }
 
-    /// Returns the eight-byte header plus the payload rounded up to its eight-byte record size.
+    /// Returns the record header plus the payload rounded up to its eight-byte record size.
     fn total(len: usize) -> usize {
-        8 + (len + 7) / 8 * 8
+        record_total(len as u64) as usize
+    }
+
+    fn private(head: u64, tail: u64) -> Private {
+        Private {
+            head: AtomicU64::new(head),
+            tail: AtomicU64::new(tail),
+        }
+    }
+
+    fn refresh(private: &Private, tails_word: &AtomicU64) {
+        private.tail.store(
+            tails_word.load(Ordering::Acquire),
+            Ordering::Release,
+        );
     }
 
     /// Retries `push_record` after rseq aborts caused by preemption, which pinning does not prevent.
@@ -407,72 +524,80 @@ mod tests {
     unsafe fn push_retrying(
         area: ThreadArea,
         cpu: u32,
-        head: &mut u64,
+        private: &Private,
         buffer: &mut [u8],
-        limit: u64,
+        ring_size: u64,
         src: &[u8],
+        stream: u64,
+        seq: u64,
     ) -> Push {
         for _ in 0..10_000 {
-            let head_before = *head;
-            // SAFETY: the caller provides storage for this record and is this head's sole writer.
+            // SAFETY: the caller provides storage for this record and the per-CPU private line.
             let result = unsafe {
                 push_record(
                     area,
                     cpu,
-                    head,
+                    private,
                     buffer.as_mut_ptr(),
-                    (RING_SIZE - 1) as u64,
-                    limit,
+                    ring_size,
                     src.as_ptr(),
                     src.len() as u64,
+                    stream,
+                    seq,
                 )
             };
             if result != Push::Aborted {
                 return result;
             }
-            assert_eq!(*head, head_before);
         }
         panic!("push aborted 10000 consecutive times");
     }
 
     #[test]
-    /// Tries a record one byte below and exactly at its limit.
+    /// Tries a record with one byte too little capacity and exactly enough capacity.
     fn full_boundaries_do_not_write() {
         let (area, cpu) = pinned_area();
         let payload = [0x35; 17];
         let needed = total(payload.len()) as u64;
+        let tail = 64_u64;
+        let head = tail + RING_SIZE as u64 - needed;
 
-        let mut buffer = vec![0xaa; total(payload.len())];
+        let mut buffer = vec![0xaa; RING_SIZE];
         let original = buffer.clone();
-        let mut head = 0;
+        let private = private(head, tail - 1);
         // SAFETY: the full check runs before the otherwise valid destination is written.
         let short = unsafe {
             push_retrying(
                 area,
                 cpu,
-                &mut head,
+                &private,
                 &mut buffer,
-                needed - 1,
+                RING_SIZE as u64,
                 &payload,
+                7,
+                11,
             )
         };
         assert_eq!(short, Push::Full);
-        assert_eq!(head, 0);
+        assert_eq!(private.head.load(Ordering::Relaxed), head);
         assert_eq!(buffer, original);
 
+        private.tail.store(tail, Ordering::Release);
         // SAFETY: the allocation covers the fitting record and this is its sole head writer.
         let exact = unsafe {
             push_retrying(
                 area,
                 cpu,
-                &mut head,
+                &private,
                 &mut buffer,
-                needed,
+                RING_SIZE as u64,
                 &payload,
+                7,
+                11,
             )
         };
         assert_eq!(exact, Push::Done);
-        assert_eq!(head, needed);
+        assert_eq!(private.head.load(Ordering::Relaxed), head);
     }
 
     #[test]
@@ -485,24 +610,25 @@ mod tests {
         let payload = [0x71; 16];
         let mut buffer = vec![0xaa; total(payload.len())];
         let original = buffer.clone();
-        let mut head = 0;
+        let private = private(0, 0);
 
         // SAFETY: the CPU check aborts before the otherwise valid destination is written.
         let result = unsafe {
             push_record(
                 area,
                 cpu + 1,
-                &mut head,
+                &private,
                 buffer.as_mut_ptr(),
-                (RING_SIZE - 1) as u64,
                 RING_SIZE as u64,
                 payload.as_ptr(),
                 payload.len() as u64,
+                7,
+                11,
             )
         };
 
         assert_eq!(result, Push::Aborted);
-        assert_eq!(head, 0);
+        assert_eq!(private.head.load(Ordering::Relaxed), 0);
         assert_eq!(buffer, original);
     }
 
@@ -534,22 +660,96 @@ mod tests {
                 for index in 0..len {
                     src.add(index).write(index as u8 ^ 0xa6);
                 }
-                let mut buffer = vec![0xaa; total(100)];
-                let mut head = 0;
+                let mut buffer = vec![0xaa; RING_SIZE];
+                let private = private(0, 0);
                 let src = slice::from_raw_parts(src, len);
+                let stream = 0x1020_3040_5060_7080;
+                let seq = len as u64 + 0x1122;
+
+                let check = |buffer: &[u8], pos: u64| {
+                    let offset = (pos as usize) & (RING_SIZE - 1);
+                    assert_eq!(
+                        u64::from_ne_bytes(
+                            buffer[offset + TAG_OFFSET..offset + TAG_OFFSET + 8]
+                                .try_into()
+                                .unwrap(),
+                        ),
+                        tag_for(pos),
+                    );
+                    assert_eq!(
+                        u64::from_ne_bytes(
+                            buffer[offset + LEN_OFFSET..offset + LEN_OFFSET + 8]
+                                .try_into()
+                                .unwrap(),
+                        ),
+                        len as u64,
+                    );
+                    assert_eq!(
+                        u64::from_ne_bytes(
+                            buffer[offset + STREAM_OFFSET..offset + STREAM_OFFSET + 8]
+                                .try_into()
+                                .unwrap(),
+                        ),
+                        stream,
+                    );
+                    assert_eq!(
+                        u64::from_ne_bytes(
+                            buffer[offset + SEQ_OFFSET..offset + SEQ_OFFSET + 8]
+                                .try_into()
+                                .unwrap(),
+                        ),
+                        seq,
+                    );
+                    let payload = offset + HEADER_LEN as usize;
+                    assert_eq!(&buffer[payload..payload + len], src);
+                    assert_eq!(
+                        &buffer[payload + len..offset + total(len)],
+                        vec![0xaa; total(len) - HEADER_LEN as usize - len],
+                    );
+                    assert_eq!(private.head.load(Ordering::Relaxed), pos);
+                };
+
                 let result = push_retrying(
                     area,
                     cpu,
-                    &mut head,
+                    &private,
                     &mut buffer,
-                    total(100) as u64,
+                    RING_SIZE as u64,
                     src,
+                    stream,
+                    seq,
                 );
                 assert_eq!(result, Push::Done);
-                assert_eq!(u64::from_ne_bytes(buffer[..8].try_into().unwrap()), len as u64);
-                assert_eq!(&buffer[8..8 + len], src);
-                assert_eq!(&buffer[8 + len..total(len)], vec![0xaa; total(len) - 8 - len]);
-                assert_eq!(head, total(len) as u64);
+                check(&buffer, 0);
+
+                let second = total(len) as u64;
+                let result = push_retrying(
+                    area,
+                    cpu,
+                    &private,
+                    &mut buffer,
+                    RING_SIZE as u64,
+                    src,
+                    stream,
+                    seq,
+                );
+                assert_eq!(result, Push::Done);
+                check(&buffer, second);
+
+                let empty = 4096_u64;
+                private.head.store(empty, Ordering::Relaxed);
+                let result = push_retrying(
+                    area,
+                    cpu,
+                    &private,
+                    &mut buffer,
+                    RING_SIZE as u64,
+                    src,
+                    stream,
+                    seq,
+                );
+                assert_eq!(result, Push::Done);
+                check(&buffer, empty);
             }
 
             assert_eq!(libc::munmap(mapping, page_size * 2), 0);
@@ -619,10 +819,10 @@ mod tests {
         assert!(cpus.len() >= 2, "test requires at least two available CPUs");
         let writer_cpu = cpus[0];
         let other_cpu = cpus[1];
-        let head = AtomicU64::new(0);
-        let tail = AtomicU64::new(0);
-        let bytes = (0..RING_SIZE + total(8 * 1024))
-            .map(|_| AtomicU8::new(0))
+        let private = private(0, 0);
+        let tails = AtomicU64::new(0);
+        let bytes = (0..(RING_SIZE + total(8 * 1024)) / 8)
+            .map(|_| AtomicU64::new(0))
             .collect::<Vec<_>>();
         let active = AtomicUsize::new(WRITERS);
         let start = Barrier::new(WRITERS + 1);
@@ -630,8 +830,8 @@ mod tests {
         let signal_stop = AtomicBool::new(false);
 
         thread::scope(|scope| {
-            let head = &head;
-            let tail = &tail;
+            let private = &private;
+            let tails = &tails;
             let bytes = &bytes;
             let active = &active;
             let start = &start;
@@ -654,23 +854,26 @@ mod tests {
                     while Instant::now() < deadline {
                         let len = record_len(writer_id, records);
                         fill_record(&mut record[..len], writer_id, records);
-                        let limit = tail.load(Ordering::Acquire) + RING_SIZE as u64;
                         // SAFETY: the allocation covers wrapped records and rseq serializes writers.
                         let result = unsafe {
                             push_record(
                                 area,
                                 writer_cpu as u32,
-                                head.as_ptr(),
+                                private,
                                 base,
-                                (RING_SIZE - 1) as u64,
-                                limit,
+                                RING_SIZE as u64,
                                 record.as_ptr(),
                                 len as u64,
+                                writer_id as u64,
+                                records,
                             )
                         };
                         match result {
                             Push::Done => records += 1,
-                            Push::Full => thread::yield_now(),
+                            Push::Full => {
+                                refresh(private, tails);
+                                thread::yield_now();
+                            }
                             Push::Aborted => aborts += 1,
                         }
                     }
@@ -686,34 +889,46 @@ mod tests {
                 let base = bytes.as_ptr() as *mut u8;
                 pin_to(other_cpu);
                 let mut tail_value = 0_u64;
-                let mut previous_head = 0_u64;
                 let mut expected = vec![0_u64; WRITERS];
 
                 loop {
-                    let head_value = head.load(Ordering::Acquire);
-                    assert!(head_value >= previous_head);
-                    previous_head = head_value;
-                    while tail_value < head_value {
-                        let offset = (tail_value as usize) & (RING_SIZE - 1);
-                        // SAFETY: the acquired head exposes a complete header at this ring position.
-                        let len = unsafe { ptr::read_unaligned(base.add(offset).cast::<u64>()) as usize };
+                    let offset = (tail_value as usize) & (RING_SIZE - 1);
+                    // SAFETY: every record position is eight-aligned in this allocation.
+                    let tag = unsafe { &*base.add(offset).cast::<AtomicU64>() };
+                    if tag.load(Ordering::Acquire) == tag_for(tail_value) {
+                        // SAFETY: the acquired tag exposes a complete header at this ring position.
+                        let len = unsafe {
+                            ptr::read_unaligned(base.add(offset + LEN_OFFSET).cast::<u64>()) as usize
+                        };
                         assert!((16..=8 * 1024).contains(&len));
-                        let next = tail_value + total(len) as u64;
-                        assert!(next <= head_value);
+                        // SAFETY: the acquired tag exposes the remaining header fields.
+                        let stream = unsafe {
+                            ptr::read_unaligned(base.add(offset + STREAM_OFFSET).cast::<u64>())
+                        };
+                        // SAFETY: the acquired tag exposes the remaining header fields.
+                        let seq = unsafe {
+                            ptr::read_unaligned(base.add(offset + SEQ_OFFSET).cast::<u64>())
+                        };
+                        assert!(stream < WRITERS as u64);
+                        assert_eq!(seq, expected[stream as usize]);
                         // SAFETY: the allocation includes enough trailing bytes for a wrapped record.
-                        let record = unsafe { slice::from_raw_parts(base.add(offset + 8), len) };
+                        let record = unsafe {
+                            slice::from_raw_parts(
+                                base.add(offset + HEADER_LEN as usize),
+                                len,
+                            )
+                        };
                         check_record(record, &mut expected);
-                        tail_value = next;
+                        tail_value += total(len) as u64;
+                        tails.store(tail_value, Ordering::Release);
+                        continue;
                     }
-                    tail.store(tail_value, Ordering::Release);
-                    if active.load(Ordering::Acquire) == 0
-                        && tail_value == head.load(Ordering::Acquire)
-                    {
-                        break;
+                    if active.load(Ordering::Acquire) == 0 {
+                        if tag.load(Ordering::Acquire) != tag_for(tail_value) {
+                            break;
+                        }
                     }
-                    if tail_value == head_value {
-                        std::hint::spin_loop();
-                    }
+                    std::hint::spin_loop();
                 }
                 expected
             });
@@ -751,19 +966,23 @@ mod tests {
         let (area, cpu) = pinned_area();
         let payload = [0x5a; 8];
         let mut buffer = vec![0xaa; RING_SIZE + total(payload.len())];
+        let private = private(0, 0);
         let mut descriptor_address = 0_u64;
 
         for _ in 0..10_000 {
-            let mut head = 0;
-            // SAFETY: the test allocations cover the record and only this thread writes `head`.
+            private.head.store(0, Ordering::Relaxed);
+            buffer[..8].fill(0xaa);
+            // SAFETY: the test allocations cover the record and only this CPU writes `private`.
             let result = unsafe {
                 push_retrying(
                     area,
                     cpu,
-                    &mut head,
+                    &private,
                     &mut buffer,
                     RING_SIZE as u64,
                     &payload,
+                    7,
+                    11,
                 )
             };
             assert_eq!(result, Push::Done);
@@ -798,7 +1017,7 @@ mod tests {
             // with any registers. It is read before `start_ip` as the arming store to rseq_cs.
             assert_eq!(arming & 0xffff_fc00, 0xf900_0400);
             // With the same mask, `0xC89F_FC00` is a 64-bit `stlr` with any registers. It is read
-            // before `start_ip + post_commit_offset` as the commit store to `head`.
+            // before `start_ip + post_commit_offset` as the commit store to the tag.
             assert_eq!(commit & 0xffff_fc00, 0xc89f_fc00);
         }
 
