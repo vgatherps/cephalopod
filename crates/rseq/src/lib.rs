@@ -113,7 +113,9 @@ pub enum Push {
 /// | 20 | the `struct rseq_cs` descriptor (in `__rseq_cs`) |
 /// | 30 | start of the critical section |
 /// | 40 | end of the critical section, right after the head store |
-/// | 50, 51, 52 | aarch64 copy loops (8 bytes at a time, then single bytes, then commit) |
+/// | 52 | aarch64 payload-copy join and commit |
+/// | 53 | aarch64 32-byte copy loop and trailing overlapping copy |
+/// | 54, 55, 56, 57, 58 | aarch64 copy cases for 16-31, 8-15, 4-7, 2-3, and 0-1 bytes |
 /// | 60 | abort handler: result 2, `Aborted` |
 /// | 70 | ring full: result 1, `Full` |
 /// | 90 | common exit; success leaves result 0, `Done` |
@@ -206,10 +208,11 @@ pub unsafe fn push_record(
             options(att_syntax, nostack),
         );
 
-        // aarch64. There is no `rep movsb`, so the copy is two loops over named cursors:
+        // aarch64. There is no `rep movsb`, so the copy uses overlapping loads:
         //   src, dst: source and destination cursors
         //   left: bytes left to copy, starts at `len`
-        //   word: the 8-byte or 1-byte value in flight
+        //   src_end, dst_end: ends of the source and destination payloads
+        //   qa, qb (NEON), ra, rb (general): values in flight
         #[cfg(target_arch = "aarch64")]
         asm!(
             // Step 1: descriptor = { version 0, flags 0, start, length, abort handler }.
@@ -241,21 +244,68 @@ pub unsafe fn push_record(
             "and {dst}, {pos}, {mask}",
             "add {dst}, {ring_base}, {dst}",
             "str {left}, [{dst}], #8",
-            // Step 5d: copy the payload, 8 bytes at a time while at least 8 are left...
-            "50:",
-            "cmp {left}, #8",
-            "b.lo 51f",
-            "ldr {word}, [{src}], #8",
-            "str {word}, [{dst}], #8",
-            "sub {left}, {left}, #8",
-            "b 50b",
-            // ...then the last 0-7 bytes one at a time, so `src` is never read past `len`.
-            "51:",
+            "add {src_end}, {src}, {left}",
+            "add {dst_end}, {dst}, {left}",
+            "cmp {left}, #32",
+            "b.lo 54f",
+            // Step 5d: lengths of at least 32 load full remaining blocks; the trailing load ends
+            // at `src_end`, so no load passes it.
+            "53:",
+            "ldp {qa:q}, {qb:q}, [{src}], #32",
+            "stp {qa:q}, {qb:q}, [{dst}], #32",
+            "sub {left}, {left}, #32",
+            "cmp {left}, #32",
+            "b.hs 53b",
             "cbz {left}, 52f",
-            "ldrb {word:w}, [{src}], #1",
-            "strb {word:w}, [{dst}], #1",
-            "sub {left}, {left}, #1",
-            "b 51b",
+            "ldp {qa:q}, {qb:q}, [{src_end}, #-32]",
+            "stp {qa:q}, {qb:q}, [{dst_end}, #-32]",
+            "b 52f",
+            // Step 5d: lengths 16 through 31 load at the start and ending at `src_end`, so no
+            // load passes it.
+            "54:",
+            "cmp {left}, #16",
+            "b.lo 55f",
+            "ldr {qa:q}, [{src}]",
+            "ldr {qb:q}, [{src_end}, #-16]",
+            "str {qa:q}, [{dst}]",
+            "str {qb:q}, [{dst_end}, #-16]",
+            "b 52f",
+            // Step 5d: lengths 8 through 15 load at the start and ending at `src_end`, so no
+            // load passes it.
+            "55:",
+            "cmp {left}, #8",
+            "b.lo 56f",
+            "ldr {ra}, [{src}]",
+            "ldr {rb}, [{src_end}, #-8]",
+            "str {ra}, [{dst}]",
+            "str {rb}, [{dst_end}, #-8]",
+            "b 52f",
+            // Step 5d: lengths 4 through 7 load at the start and ending at `src_end`, so no load
+            // passes it.
+            "56:",
+            "cmp {left}, #4",
+            "b.lo 57f",
+            "ldr {ra:w}, [{src}]",
+            "ldr {rb:w}, [{src_end}, #-4]",
+            "str {ra:w}, [{dst}]",
+            "str {rb:w}, [{dst_end}, #-4]",
+            "b 52f",
+            // Step 5d: lengths 2 and 3 load at the start and ending at `src_end`, so no load
+            // passes it.
+            "57:",
+            "cmp {left}, #2",
+            "b.lo 58f",
+            "ldrh {ra:w}, [{src}]",
+            "ldrh {rb:w}, [{src_end}, #-2]",
+            "strh {ra:w}, [{dst}]",
+            "strh {rb:w}, [{dst_end}, #-2]",
+            "b 52f",
+            // Step 5d: length 1 copies one byte; length 0 copies nothing. Neither passes
+            // `src_end`. Both fall through to the commit.
+            "58:",
+            "cbz {left}, 52f",
+            "ldrb {ra:w}, [{src}]",
+            "strb {ra:w}, [{dst}]",
             // Step 5e: commit. Store-release of the new head orders it after the payload stores;
             // last instruction of the section.
             "52:",
@@ -285,7 +335,12 @@ pub unsafe fn push_record(
             pos = out(reg) _,
             new_head = out(reg) _,
             dst = out(reg) _,
-            word = out(reg) _,
+            src_end = out(reg) _,
+            dst_end = out(reg) _,
+            qa = out(vreg) _,
+            qb = out(vreg) _,
+            ra = out(reg) _,
+            rb = out(reg) _,
             result = lateout(reg) result,
             options(nostack),
         );
@@ -419,7 +474,7 @@ mod tests {
     /// advance.
     fn record_layout() {
         let (area, cpu) = pinned_area();
-        for len in [0, 1, 7, 8, 9, 15, 16, 17, 100] {
+        for len in [0, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 100] {
             let payload: Vec<u8> = (0..len).map(|index| index as u8 ^ 0x5a).collect();
             let mut buffer = vec![0xaa; RING_SIZE + total(100)];
             let mut head = 0;
@@ -544,7 +599,7 @@ mod tests {
 
     #[test]
     /// Places payloads immediately before a protected page and copies every length through
-    /// seventeen bytes.
+    /// one hundred bytes.
     ///
     /// Each call must finish and reproduce exactly `len` bytes; a read past `src + len` faults,
     /// enters the rseq abort handler, and appears here as endless `Aborted` retries rather than a
@@ -566,12 +621,12 @@ mod tests {
             let guard = mapping.cast::<u8>().add(page_size);
             assert_eq!(libc::mprotect(guard.cast(), page_size, libc::PROT_NONE), 0);
 
-            for len in 0..=17 {
+            for len in 0..=100 {
                 let src = guard.sub(len);
                 for index in 0..len {
                     src.add(index).write(index as u8 ^ 0xa6);
                 }
-                let mut buffer = vec![0xaa; RING_SIZE + total(17)];
+                let mut buffer = vec![0xaa; RING_SIZE + total(100)];
                 let mut head = 0;
                 let result = push_until_not_aborted(
                     area,
