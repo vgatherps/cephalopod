@@ -74,7 +74,11 @@ impl Listener {
                 libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, 10)
             };
             if result < 0 {
-                return Err(io::Error::last_os_error());
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
             }
 
             if pollfds[0].revents & libc::POLLIN != 0 && !self.accept_all()? {
@@ -116,17 +120,30 @@ impl Listener {
                             }
                         }
                     }
-                    Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => return Ok(()),
                 }
             }
         }
     }
 
     fn accept_all(&mut self) -> io::Result<bool> {
-        loop {
+        for _ in 0..64 {
             let (mut socket, _) = match self.socket.accept() {
                 Ok(pair) => pair,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(true),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error) if matches!(error.raw_os_error(), Some(23 | 24)) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    return Ok(true);
+                }
                 Err(error) => return Err(error),
             };
             let Some(slot) = self.free.pop() else {
@@ -139,11 +156,26 @@ impl Listener {
             if self.control.send(Control::Open { slot, uid }).is_err() {
                 return Ok(false);
             }
-            socket.write_all(&pack(slot, uid).to_le_bytes())?;
-            socket.write_all(&(self.prefix.len() as u16).to_le_bytes())?;
-            socket.write_all(&self.prefix)?;
+            let reply = socket
+                .set_nonblocking(false)
+                .and_then(|()| {
+                    socket.set_write_timeout(Some(std::time::Duration::from_millis(100)))
+                })
+                .and_then(|()| socket.write_all(&pack(slot, uid).to_le_bytes()))
+                .and_then(|()| socket.write_all(&(self.prefix.len() as u16).to_le_bytes()))
+                .and_then(|()| socket.write_all(&self.prefix));
+            if reply.is_err() {
+                drop(socket);
+                let sent = self.control.send(Control::Close { slot, uid }).is_ok();
+                self.free.push(slot);
+                if !sent {
+                    return Ok(false);
+                }
+                continue;
+            }
             self.live[slot as usize] = Some((uid, socket));
         }
+        Ok(true)
     }
 }
 
@@ -181,4 +213,3 @@ impl Session {
         result > 0 && pollfd.revents & (libc::POLLIN | libc::POLLHUP) != 0
     }
 }
-

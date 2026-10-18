@@ -4,7 +4,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 
 use ceph_fifo::Fifo;
 use ceph_proto::{Control, Kick, pack};
-use ceph_ring::{Config, Reader, Writer};
+use ceph_ring::{Config, PushError, Reader, Writer};
 
 const KIB: usize = 1024;
 
@@ -101,9 +101,67 @@ fn stall_kicks_the_stream() {
     assert_eq!(kicks.try_recv(), Ok(Kick { slot: 1, uid: 7 }));
 
     writer.try_push(b"two", stream, 2).unwrap();
-    assert_eq!(next_message(&mut fifo), None);
+    let second = pack(2, 9);
+    control.send(Control::Open { slot: 2, uid: 9 }).unwrap();
+    writer.try_push(b"zero", second, 0).unwrap();
+    assert_eq!(
+        next_message(&mut fifo),
+        Some((second, 0, b"zero".to_vec()))
+    );
     assert_eq!(next_message(&mut fifo), None);
     assert_eq!(kicks.try_recv(), Err(TryRecvError::Empty));
+}
+
+#[test]
+fn held_message_blocks_publish() {
+    let (writer, mut fifo, control, _kicks) = setup("held-message");
+    let cpu = allowed_cpus()[0];
+    let stream = pack(1, 7);
+    let payload = vec![0x5a; 200];
+    control.send(Control::Open { slot: 1, uid: 7 }).unwrap();
+    pin(&[cpu]);
+
+    let mut seq = 0;
+    loop {
+        match writer.try_push(&payload, stream, seq) {
+            Ok(()) => seq += 1,
+            Err(PushError::Full) => break,
+            Err(error) => panic!("unexpected push error: {error:?}"),
+        }
+    }
+
+    let message = fifo.next().unwrap();
+    assert_eq!(writer.try_push(&payload, stream, seq), Err(PushError::Full));
+    assert_eq!(message.payload, payload);
+    drop(message);
+
+    while fifo.next().is_some() {}
+    assert_eq!(writer.try_push(&payload, stream, seq), Ok(()));
+}
+
+#[test]
+fn open_after_sweep_started() {
+    let (writer, mut fifo, control, _kicks) = setup("open-after-sweep");
+    let cpus = allowed_cpus();
+    assert!(cpus.len() >= 2);
+    let first = pack(1, 7);
+    let second = pack(2, 9);
+    control.send(Control::Open { slot: 1, uid: 7 }).unwrap();
+
+    pin(&[cpus[0]]);
+    writer.try_push(b"first", first, 0).unwrap();
+    pin(&[cpus[1]]);
+    writer.try_push(b"second", second, 0).unwrap();
+
+    assert_eq!(
+        next_message(&mut fifo),
+        Some((first, 0, b"first".to_vec()))
+    );
+    control.send(Control::Open { slot: 2, uid: 9 }).unwrap();
+    assert_eq!(
+        next_message(&mut fifo),
+        Some((second, 0, b"second".to_vec()))
+    );
 }
 
 #[test]

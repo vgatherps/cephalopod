@@ -261,7 +261,7 @@ impl Reader {
         let tail = self.tails[ring];
         let start = self.record_start(ring, tail);
         // SAFETY: record starts are 8-aligned and the ring is mapped twice contiguously.
-        let tag = unsafe { (&*start.add(TAG_OFFSET).cast::<AtomicU64>()).load(Relaxed) };
+        let tag = unsafe { (&*start.add(TAG_OFFSET).cast::<AtomicU64>()).load(Acquire) };
         assert_eq!(tag, tag_for(tail), "ring {ring}: no record at {tail}");
         // SAFETY: the caller acquired this record's tag through `front`.
         let len = unsafe { start.add(LEN_OFFSET).cast::<u64>().read() as usize };

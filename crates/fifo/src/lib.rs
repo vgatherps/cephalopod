@@ -3,6 +3,8 @@ use std::sync::mpsc::{Receiver, Sender};
 use ceph_proto::{Control, Kick, slot, uid};
 use ceph_ring::{Reader, Record};
 
+const BATCH: usize = 64;
+
 pub struct Message<'a> {
     pub stream: u64,
     pub seq: u64,
@@ -21,6 +23,7 @@ pub struct Fifo {
     slots: Vec<Slot>,
     ready: Vec<usize>,
     pos: usize,
+    batch: usize,
     stopped: bool,
     delivered: bool,
     empty_sweeps: u32,
@@ -40,6 +43,7 @@ impl Fifo {
             slots: vec![Slot::default(); max_streams as usize],
             ready: Vec::new(),
             pos: 0,
+            batch: 0,
             stopped: false,
             delivered: false,
             empty_sweeps: 0,
@@ -49,7 +53,8 @@ impl Fifo {
     }
 
     /// Returns the next deliverable message, or `None` if none is available now. The returned
-    /// payload remains valid until the next call to `next`.
+    /// payload remains valid until the next call to `next`. Up to 64 consecutive messages are
+    /// delivered from one ring before advancing to the next ring.
     pub fn next(&mut self) -> Option<Message<'_>> {
         loop {
             if self.pos == self.ready.len() {
@@ -63,6 +68,7 @@ impl Fifo {
             let ring = self.ready[self.pos];
             let Some(header) = self.reader.front(ring) else {
                 self.pos += 1;
+                self.batch = 0;
                 continue;
             };
             let index = slot(header.stream) as usize;
@@ -87,12 +93,17 @@ impl Fifo {
             if header.seq > state.expected {
                 self.stopped = true;
                 self.pos += 1;
+                self.batch = 0;
                 continue;
             }
 
             self.slots[index].expected += 1;
             self.delivered = true;
-            self.pos += 1;
+            self.batch += 1;
+            if self.batch == BATCH {
+                self.pos += 1;
+                self.batch = 0;
+            }
             let Record {
                 stream,
                 seq,
@@ -112,6 +123,7 @@ impl Fifo {
         self.ready.clear();
         self.reader.poll(&mut self.ready);
         self.pos = 0;
+        self.batch = 0;
         self.stopped = false;
         self.delivered = false;
     }
@@ -167,5 +179,45 @@ impl Fifo {
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ceph_ring::Config;
+    use std::sync::mpsc;
+
+    #[test]
+    fn empty_stopped_sweeps_do_not_kick() {
+        let prefix = format!("ceph-fifo-unit-{}", std::process::id());
+        // SAFETY: sysconf reads a process-wide constant.
+        let ring_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+        let reader = Reader::create(
+            &prefix,
+            Config {
+                ring_size,
+                max_record: 16,
+            },
+        )
+        .unwrap();
+        let (_control_tx, control_rx) = mpsc::channel();
+        let (kick_tx, kick_rx) = mpsc::channel();
+        let mut fifo = Fifo::new(reader, 1, control_rx, kick_tx);
+
+        fifo.stopped = true;
+        fifo.finish_sweep();
+        assert_eq!(fifo.empty_sweeps, 1);
+        assert_eq!(
+            kick_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        );
+
+        fifo.finish_sweep();
+        assert_eq!(fifo.empty_sweeps, 0);
+        assert_eq!(
+            kick_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        );
     }
 }

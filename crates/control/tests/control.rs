@@ -2,7 +2,7 @@ use ceph_control::{Listener, connect};
 use ceph_proto::{Control, Kick, pack};
 use std::fs;
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
@@ -17,54 +17,60 @@ fn socket_path() -> PathBuf {
     directory.join("s")
 }
 
-fn stop(path: &Path, control: mpsc::Receiver<Control>, thread: thread::JoinHandle<()>) {
-    let wake = UnixStream::connect(path).unwrap();
-    drop(control);
-    drop(wake);
-    thread.join().unwrap();
-    fs::remove_file(path).unwrap();
-    fs::remove_dir(path.parent().unwrap()).unwrap();
-}
-
 #[test]
 fn connect_opens_and_close_closes() {
     let path = socket_path();
     let (control_tx, control_rx) = mpsc::channel();
-    let (_kick_tx, kick_rx) = mpsc::channel();
+    let (kick_tx, kick_rx) = mpsc::channel();
     let listener = Listener::bind(&path, "ceph-test", 2, control_tx, kick_rx).unwrap();
     let thread = thread::spawn(move || listener.run().unwrap());
 
-    let first = connect(&path).unwrap();
-    assert_eq!(first.stream, pack(0, 1));
-    assert_eq!(first.prefix, "ceph-test");
+    let dropped = UnixStream::connect(&path).unwrap();
+    drop(dropped);
     assert_eq!(
-        control_rx.recv().unwrap(),
+        control_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
         Control::Open { slot: 0, uid: 1 }
     );
-
-    let second = connect(&path).unwrap();
-    assert_eq!(second.stream, pack(1, 2));
-    assert_eq!(
-        control_rx.recv().unwrap(),
-        Control::Open { slot: 1, uid: 2 }
-    );
-
-    drop(first);
     assert_eq!(
         control_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
         Control::Close { slot: 0, uid: 1 }
     );
 
-    let third = connect(&path).unwrap();
-    assert_eq!(third.stream, pack(0, 3));
+    let first = connect(&path).unwrap();
+    assert_eq!(first.stream, pack(0, 2));
+    assert_eq!(first.prefix, "ceph-test");
     assert_eq!(
-        control_rx.recv().unwrap(),
-        Control::Open { slot: 0, uid: 3 }
+        control_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        Control::Open { slot: 0, uid: 2 }
+    );
+
+    let second = connect(&path).unwrap();
+    assert_eq!(second.stream, pack(1, 3));
+    assert_eq!(
+        control_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        Control::Open { slot: 1, uid: 3 }
+    );
+
+    drop(first);
+    assert_eq!(
+        control_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        Control::Close { slot: 0, uid: 2 }
+    );
+
+    let third = connect(&path).unwrap();
+    assert_eq!(third.stream, pack(0, 4));
+    assert_eq!(
+        control_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        Control::Open { slot: 0, uid: 4 }
     );
 
     drop(second);
     drop(third);
-    stop(&path, control_rx, thread);
+    drop(control_rx);
+    drop(kick_tx);
+    thread.join().unwrap();
+    fs::remove_file(&path).unwrap();
+    fs::remove_dir(path.parent().unwrap()).unwrap();
 }
 
 #[test]
@@ -77,7 +83,7 @@ fn kick_closes_the_player() {
 
     let session = connect(&path).unwrap();
     assert_eq!(
-        control_rx.recv().unwrap(),
+        control_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
         Control::Open { slot: 0, uid: 1 }
     );
     kick_tx.send(Kick { slot: 0, uid: 1 }).unwrap();
@@ -92,5 +98,9 @@ fn kick_closes_the_player() {
         Control::Close { slot: 0, uid: 1 }
     );
 
-    stop(&path, control_rx, thread);
+    drop(control_rx);
+    drop(kick_tx);
+    thread.join().unwrap();
+    fs::remove_file(&path).unwrap();
+    fs::remove_dir(path.parent().unwrap()).unwrap();
 }
