@@ -7,7 +7,5 @@ edition = "2024"
 version = "0.1.0"
 
 [workspace.dependencies]
-anyhow = "1"
 libc = "0.2"
 ceph-rseq = { path = "crates/rseq" }
-mapping = { path = "../../trading/cantor-core/potatomato/core/mapping" }
