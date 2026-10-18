@@ -1,0 +1,7 @@
+[package]
+name = "ceph-proto"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "ceph_proto"

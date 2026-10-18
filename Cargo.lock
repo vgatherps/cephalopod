@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "ceph-proto"
+version = "0.1.0"
+
+[[package]]
 name = "ceph-ring"
 version = "0.1.0"
 dependencies = [
