@@ -309,25 +309,6 @@ impl Reader {
         }
     }
 
-    /// Visits committed records in `ring`. Stops before the first record for which `f` returns
-    /// false and leaves it in the ring. Returns the number of records consumed.
-    pub fn read(&mut self, ring: usize, mut f: impl FnMut(Record<'_>) -> bool) -> usize {
-        let mut consumed = 0;
-        loop {
-            let Some(_) = self.front(ring) else {
-                break;
-            };
-            let record = self.view(ring);
-            if !f(record) {
-                break;
-            }
-            self.advance(ring);
-            consumed += 1;
-        }
-        self.publish_ring(ring);
-        consumed
-    }
-
     fn record_start(&self, ring: usize, tail: u64) -> *mut u8 {
         let (base, _, _) = self.map.ring(ring);
         let mask = self.map.ring_size as u64 - 1;

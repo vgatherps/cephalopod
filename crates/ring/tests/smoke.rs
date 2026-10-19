@@ -1,5 +1,16 @@
 use ceph_ring::{Config, Reader, Writer};
 
+fn drain(reader: &mut Reader, ring: usize) -> Vec<(u64, u64, Vec<u8>)> {
+    let mut records = Vec::new();
+    while reader.front(ring).is_some() {
+        let record = reader.view(ring);
+        records.push((record.stream, record.seq, record.payload.to_vec()));
+        reader.advance(ring);
+    }
+    reader.publish();
+    records
+}
+
 #[test]
 fn push_and_read_back() {
     // macOS limits shm names to 31 bytes including the slash.
@@ -25,10 +36,11 @@ fn push_and_read_back() {
     let mut seen = Vec::new();
     for &ring in &ready {
         let mut in_ring = Vec::new();
-        reader.read(ring, |r| {
-            in_ring.push((r.seq, r.stream, r.payload.to_vec()));
-            true
-        });
+        in_ring.extend(
+            drain(&mut reader, ring)
+                .into_iter()
+                .map(|(stream, seq, payload)| (seq, stream, payload)),
+        );
         assert!(
             in_ring.windows(2).all(|w| w[0].0 < w[1].0),
             "ring {ring} out of order"

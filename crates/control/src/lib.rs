@@ -140,10 +140,6 @@ impl Listener {
                 {
                     continue;
                 }
-                Err(error) if matches!(error.raw_os_error(), Some(23 | 24)) => {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                    return Ok(true);
-                }
                 Err(error) => return Err(error),
             };
             let Some(slot) = self.free.pop() else {

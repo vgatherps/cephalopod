@@ -3,7 +3,7 @@
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use ceph_ring::{Config, PushError, Reader, Record, Writer};
+use ceph_ring::{Config, PushError, Reader, Writer};
 
 const KIB: usize = 1024;
 const CHILD_ENV: &str = "CEPH_RING_CHILD";
@@ -44,6 +44,17 @@ fn indexed_record(i: usize) -> Vec<u8> {
     (0..i % 301).map(|j| (i * 7 + j) as u8).collect()
 }
 
+fn drain(reader: &mut Reader, ring: usize) -> Vec<(u64, u64, Vec<u8>)> {
+    let mut records = Vec::new();
+    while reader.front(ring).is_some() {
+        let record = reader.view(ring);
+        records.push((record.stream, record.seq, record.payload.to_vec()));
+        reader.advance(ring);
+    }
+    reader.publish();
+    records
+}
+
 #[test]
 fn round_trip_and_wrap() {
     let p = prefix("round_trip_and_wrap");
@@ -59,28 +70,31 @@ fn round_trip_and_wrap() {
     for &k in allowed_cpus().iter().take(2) {
         pin(&[k]);
         let (mut pushed, mut next) = (0, 0);
-        let mut check = |r: Record<'_>| {
-            assert_eq!(r.stream, k as u64, "ring {k} record {next}");
-            assert_eq!(r.seq, next as u64, "ring {k} record {next}");
-            assert_eq!(r.payload, indexed_record(next), "ring {k} record {next}");
+        let mut check = |(stream, seq, payload): (u64, u64, Vec<u8>)| {
+            assert_eq!(stream, k as u64, "ring {k} record {next}");
+            assert_eq!(seq, next as u64, "ring {k} record {next}");
+            assert_eq!(payload, indexed_record(next), "ring {k} record {next}");
             next += 1;
-            true
         };
         while pushed < 1000 {
             match writer.try_push(&indexed_record(pushed), k as u64, pushed as u64) {
                 Ok(()) => pushed += 1,
-                Err(PushError::Full) => assert!(reader.read(k, &mut check) > 0),
+                Err(PushError::Full) => {
+                    let records = drain(&mut reader, k);
+                    assert!(!records.is_empty());
+                    records.into_iter().for_each(&mut check);
+                }
                 Err(e) => panic!("{e:?}"),
             }
         }
         let mut ready = Vec::new();
         reader.poll(&mut ready);
         assert_eq!(ready, [k]);
-        reader.read(k, &mut check);
+        drain(&mut reader, k).into_iter().for_each(&mut check);
         assert_eq!(next, pushed);
         for other in (0..reader.nr_rings()).filter(|&r| r != k) {
             assert_eq!(
-                reader.read(other, |_| true),
+                drain(&mut reader, other).len(),
                 0,
                 "ring {other} got a record from cpu {k}"
             );
@@ -109,28 +123,17 @@ fn full_boundary_and_oversize() {
         assert_eq!(writer.try_push(&rec, 7, seq), Ok(()));
     }
     assert_eq!(writer.try_push(&rec, 7, 15), Err(PushError::Full));
-    let mut first = true;
-    assert_eq!(
-        reader.read(cpu, |r| {
-            if first {
-                first = false;
-                assert_eq!((r.stream, r.seq, r.payload), (7, 0, &rec[..]));
-                true
-            } else {
-                false
-            }
-        }),
-        1
-    );
+    let record = reader.view(cpu);
+    assert_eq!((record.stream, record.seq, record.payload), (7, 0, &rec[..]));
+    reader.advance(cpu);
+    reader.publish();
     assert_eq!(writer.try_push(&rec, 7, 15), Ok(()));
-    assert_eq!(
-        reader.read(cpu, |r| {
-            assert_eq!(r.stream, 7);
-            assert_eq!(r.payload, rec);
-            true
-        }),
-        15
-    );
+    let records = drain(&mut reader, cpu);
+    assert_eq!(records.len(), 15);
+    for (stream, _, payload) in records {
+        assert_eq!(stream, 7);
+        assert_eq!(payload, rec);
+    }
 
     let big: Vec<u8> = (0..max).map(|j| (j * 13) as u8).collect();
     assert_eq!(writer.try_push(&big, 8, 16), Ok(()));
@@ -139,13 +142,7 @@ fn full_boundary_and_oversize() {
         writer.try_push(&vec![0; max + 1], 8, 17),
         Err(PushError::TooLarge)
     );
-    assert_eq!(
-        reader.read(cpu, |r| {
-            assert_eq!((r.stream, r.seq, r.payload), (8, 16, &big[..]));
-            true
-        }),
-        1
-    );
+    assert_eq!(drain(&mut reader, cpu), [(8, 16, big)]);
 }
 
 #[test]
@@ -167,21 +164,25 @@ fn stop_before() {
     }
 
     let mut seen = Vec::new();
-    let consumed = reader.read(cpu, |r| {
-        assert_eq!(r.stream, 9);
-        seen.push((r.seq, r.payload.to_vec()));
-        r.payload != b"BB"
-    });
-    assert_eq!(consumed, 1);
+    let header = reader.front(cpu).unwrap();
+    assert_eq!(header.stream, 9);
+    let record = reader.view(cpu);
+    assert_eq!(record.stream, 9);
+    seen.push((record.seq, record.payload.to_vec()));
+    reader.advance(cpu);
+    let header = reader.front(cpu).unwrap();
+    assert_eq!(header.stream, 9);
+    let record = reader.view(cpu);
+    assert_eq!(record.stream, 9);
+    seen.push((record.seq, record.payload.to_vec()));
+    reader.publish();
     assert_eq!(seen, [(0, b"A".to_vec()), (1, b"BB".to_vec())]);
 
     seen.clear();
-    let consumed = reader.read(cpu, |r| {
-        assert_eq!(r.stream, 9);
-        seen.push((r.seq, r.payload.to_vec()));
-        true
-    });
-    assert_eq!(consumed, 2);
+    for (stream, seq, payload) in drain(&mut reader, cpu) {
+        assert_eq!(stream, 9);
+        seen.push((seq, payload));
+    }
     assert_eq!(seen, [(1, b"BB".to_vec()), (2, b"CCC".to_vec())]);
 }
 
@@ -213,19 +214,17 @@ fn run_child(spec: &str) {
     }
 }
 
-fn drain(reader: &mut Reader, seen: &mut [Vec<u64>]) {
+fn drain_children(reader: &mut Reader, seen: &mut [Vec<u64>]) {
     for ring in 0..reader.nr_rings() {
-        reader.read(ring, |r| {
-            let id = u32::try_from(r.stream).unwrap();
-            let index = r.seq;
+        for (stream, index, payload) in drain(reader, ring) {
+            let id = u32::try_from(stream).unwrap();
             assert_eq!(
-                r.payload,
+                payload,
                 child_record(id, index),
                 "child {id} index {index}"
             );
             seen[id as usize].push(index);
-            true
-        });
+        }
     }
 }
 
@@ -261,13 +260,13 @@ fn multi_process() {
     let deadline = Instant::now() + Duration::from_secs(60);
     while !seen.iter().all(|s| s.len() as u64 >= COUNT) {
         assert!(Instant::now() < deadline, "children stalled");
-        drain(&mut reader, &mut seen);
+        drain_children(&mut reader, &mut seen);
     }
     for (id, child) in children.iter_mut().enumerate() {
         let status = child.wait().unwrap();
         assert!(status.success(), "child {id}: {status}");
     }
-    drain(&mut reader, &mut seen);
+    drain_children(&mut reader, &mut seen);
 
     for (id, mut indexes) in seen.into_iter().enumerate() {
         indexes.sort_unstable();
@@ -299,9 +298,5 @@ fn stale_object() {
         .unwrap()
         .try_push(b"fresh", 2, 0)
         .unwrap();
-    let consumed = reader.read(cpu, |r| {
-        assert_eq!((r.stream, r.seq, r.payload), (2, 0, &b"fresh"[..]));
-        true
-    });
-    assert_eq!(consumed, 1);
+    assert_eq!(drain(&mut reader, cpu), [(2, 0, b"fresh".to_vec())]);
 }
