@@ -119,11 +119,10 @@ impl ThreadArea {
         })
     }
 
-    /// Returns a volatile read of `cpu_id_start`; a negative value cast to `u32` means this thread
-    /// is not registered.
-    pub fn cpu_id_start(self) -> u32 {
+    /// Returns a volatile read of `cpu_id`; a negative value means this thread is not registered.
+    pub fn cpu_id(self) -> i32 {
         // SAFETY: `ThreadArea` can only be created for the calling thread's registered area.
-        unsafe { ptr::read_volatile(self.ptr.cast::<u32>()) }
+        unsafe { ptr::read_volatile(self.ptr.add(4).cast::<i32>()) }
     }
 }
 
@@ -147,7 +146,7 @@ pub enum Push {
 /// after the tag and the payload source. The section reads its CPU, selects the matching ring,
 /// advances past at most one committed record at the cached head, and checks room against the
 /// cached tail. Only when that check fails does it acquire the shared tail, cache it, and check
-/// once more. It then clears the following tag, writes the record, and commits with the tag store
+/// once more. It then writes the record, clears the following tag, and commits with the tag store
 /// as the section's last instruction.
 ///
 /// The cached-tail check relies on ordering: the in-section plain load of `private.tail` is
@@ -169,8 +168,9 @@ pub enum Push {
 ///    [`RingArgs`]. It advances past one committed record at the cached head when present.
 /// 5. It checks that the record and following tag word fit below the cached tail plus the ring
 ///    size. On failure it refreshes the cached tail from `shared_tail` with Acquire and checks once
-///    more. It stores the record position to the private head, then clears the following tag word.
-/// 6. It writes the length, stream, sequence number, and payload, then stores the position tag.
+///    more. It stores the record position to the private head.
+/// 6. It writes the length, stream, sequence number, and payload, clears the following tag word,
+///    then stores the position tag.
 ///    The tag store is the commit and the last instruction of the section: before it the consumer
 ///    sees no record at this position, after it the consumer sees the whole record.
 /// 7. The kernel only jumps to an abort handler preceded by the 4-byte signature glibc registered
@@ -241,7 +241,7 @@ pub unsafe fn push_record(
             "addq {rings}, {ring}",
             "movq 8({ring}), {private}",
             "movq 16({ring}), {mask}",
-            "movq 24({ring}), {scratch}",
+            "movq 24({ring}), {desc}",
             "movq ({ring}), {base}",
             // Start at the cached head.
             "movq ({private}), {cur}",
@@ -263,38 +263,38 @@ pub unsafe fn push_record(
             "movq ({record}), %rcx",
             "leaq 47({cur},%rcx), {calc}",
             "andq $-8, {calc}",
-            "movq 8({private}), {bound}",
-            "leaq 1({bound},{mask}), {bound}",
-            "cmpq {bound}, {calc}",
+            "movq 8({private}), %rdi",
+            "leaq 1(%rdi,{mask}), %rdi",
+            "cmpq %rdi, {calc}",
             "jbe 59f",
-            "movq ({scratch}), {bound}",
-            "movq {bound}, 8({private})",
-            "leaq 1({bound},{mask}), {bound}",
-            "cmpq {bound}, {calc}",
+            "movq ({desc}), %rdi",
+            "movq %rdi, 8({private})",
+            "leaq 1(%rdi,{mask}), %rdi",
+            "cmpq %rdi, {calc}",
             "ja 70f",
             "59:",
             // Cache this record's base before writing it.
             "movq {cur}, ({private})",
-            // Clear the next record's tag word.
-            "leaq -8({calc}), %rdi",
-            "andq {mask}, %rdi",
-            "movq $0, ({base},%rdi)",
             // Find the record and copy header bytes 8..32 from RecordArgs.
             "movq {cur}, %rdi",
             "andq {mask}, %rdi",
             "addq {base}, %rdi",
-            "movq %rdi, {scratch}",
+            "movq %rdi, {ring}",
             "movups ({record}), {header}",
             "movups {header}, 8(%rdi)",
-            "movq 16({record}), {calc}",
-            "movq {calc}, 24(%rdi)",
+            "movq 16({record}), {desc}",
+            "movq {desc}, 24(%rdi)",
             "addq $32, %rdi",
             "movq 24({record}), %rsi",
             // The copy is interruptible and string stores stay ordered before the tag store.
             "rep movsb",
+            // Clear the next record's tag word after the payload copy.
+            "leaq -8({calc}), %rdi",
+            "andq {mask}, %rdi",
+            "movq $0, ({base},%rdi)",
             // Commit with the position tag; last instruction of the section.
             "orq $1, {cur}",
-            "movq {cur}, ({scratch})",
+            "movq {cur}, ({ring})",
             "40:",
             "movq $0, {result}",
             "jmp 90f",
@@ -321,8 +321,6 @@ pub unsafe fn push_record(
             mask = out(reg) _,
             cur = out(reg) _,
             calc = out(reg) _,
-            scratch = out(reg) _,
-            bound = out(reg) _,
             header = out(xmm_reg) _,
             result = lateout(reg) result,
             options(att_syntax, nostack),
@@ -392,11 +390,6 @@ pub unsafe fn push_record(
             "59:",
             // Cache this record's base before writing it.
             "str {cur}, [{private}]",
-            // Clear the next record's tag word.
-            "sub {calc}, {calc}, #8",
-            "and {dst}, {calc}, {mask}",
-            "add {dst}, {ring_base}, {dst}",
-            "str xzr, [{dst}]",
             // Find the record and copy header bytes 8..32 from RecordArgs.
             "and {dst}, {cur}, {mask}",
             "add {dst}, {ring_base}, {dst}",
@@ -408,7 +401,7 @@ pub unsafe fn push_record(
             "cmp {left}, #16",
             "b.hs 56f",
             // Short payloads are staged in a readable 16-byte buffer. Extra stores land in the
-            // reserved padding and cleared following tag word.
+            // reserved padding and following tag word, which is cleared below.
             "ldr {qa:q}, [{src}]",
             "str {qa:q}, [{dst}]",
             "b 52f",
@@ -434,8 +427,13 @@ pub unsafe fn push_record(
             "cbz {left}, 52f",
             "ldr {qa:q}, [{src_end}, #-16]",
             "str {qa:q}, [{dst_end}, #-16]",
-            // Commit. Store-release of the tag orders it after the record stores.
             "52:",
+            // Clear the next record's tag word after the payload copy.
+            "sub {calc}, {calc}, #8",
+            "and {dst}, {calc}, {mask}",
+            "add {dst}, {ring_base}, {dst}",
+            "str xzr, [{dst}]",
+            // Commit. Store-release of the tag orders it after the record stores.
             "orr {cur}, {cur}, #1",
             "stlr {cur}, [{tag_ptr}]",
             "40:",
@@ -530,7 +528,7 @@ mod tests {
         let cpu = available_cpus()[0];
         pin_to(cpu);
         let area = ThreadArea::current().expect("glibc did not register rseq");
-        assert_eq!(area.cpu_id_start(), cpu as u32);
+        assert_eq!(area.cpu_id(), cpu as i32);
         (area, cpu as u32)
     }
 
@@ -712,7 +710,7 @@ mod tests {
             for len in 0..=100 {
                 let readable = if (1..16).contains(&len) { 16 } else { len };
                 let src = guard.sub(readable);
-                ptr::write_bytes(src, 0, readable);
+                ptr::write_bytes(src, if (1..16).contains(&len) { 0xff } else { 0 }, readable);
                 for index in 0..len {
                     src.add(index).write(index as u8 ^ 0xa6);
                 }
@@ -774,14 +772,20 @@ mod tests {
                     );
                     let payload = offset + HEADER_LEN as usize;
                     assert_eq!(&buffer[payload..payload + len], src);
-                    if (1..16).contains(&len) {
-                        assert_eq!(&buffer[payload + len..payload + 16], vec![0; 16 - len]);
-                    } else {
+                    if !(1..16).contains(&len) {
                         assert_eq!(
                             &buffer[payload + len..offset + total(len)],
                             vec![0xaa; total(len) - HEADER_LEN as usize - len],
                         );
                     }
+                    assert_eq!(
+                        u64::from_ne_bytes(
+                            buffer[offset + total(len)..offset + total(len) + 8]
+                                .try_into()
+                                .unwrap(),
+                        ),
+                        0,
+                    );
                     assert_eq!(private.head.load(Ordering::Relaxed), pos);
                 };
 
@@ -953,7 +957,7 @@ mod tests {
                     let base = bytes.as_ptr() as *mut u8;
                     pin_to(writer_cpu);
                     let area = ThreadArea::current().expect("glibc did not register rseq");
-                    assert_eq!(area.cpu_id_start(), writer_cpu as u32);
+                    assert_eq!(area.cpu_id(), writer_cpu as i32);
                     let rings = ring_table(base, private, RING_SIZE as u64, tails);
                     writer_tid.send(thread_id()).unwrap();
                     start.wait();

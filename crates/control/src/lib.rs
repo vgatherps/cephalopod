@@ -161,10 +161,7 @@ impl Listener {
                 return Ok(false);
             }
             let reply = socket
-                .set_nonblocking(false)
-                .and_then(|()| {
-                    socket.set_write_timeout(Some(std::time::Duration::from_millis(100)))
-                })
+                .set_write_timeout(Some(std::time::Duration::from_millis(100)))
                 .and_then(|()| socket.write_all(&pack(slot, uid).to_le_bytes()))
                 .and_then(|()| socket.write_all(&(self.prefix.len() as u16).to_le_bytes()))
                 .and_then(|()| socket.write_all(&self.prefix));

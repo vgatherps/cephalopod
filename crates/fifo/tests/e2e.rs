@@ -5,12 +5,12 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use ceph_control::{Listener, connect};
 use ceph_fifo::Fifo;
-use ceph_proto::Retire;
+use ceph_proto::{Retire, pack};
 use ceph_ring::{Config, PushError, Reader, Writer};
 
 const CHILD_ENV: &str = "CEPH_E2E_CHILD";
@@ -57,13 +57,22 @@ fn run_child(spec: &str) {
     };
     let (index, count): (usize, u64) = (index.parse().unwrap(), count.parse().unwrap());
     let cpus = allowed_cpus();
-    pin(cpus[index % cpus.len()]);
+    assert!(cpus.len() >= 2, "test requires at least two allowed CPUs");
+    let cpus = &cpus[..2];
+    let mut cpu = index % cpus.len();
+    pin(cpus[cpu]);
     let session = connect(Path::new(socket)).unwrap();
     let writer = Writer::attach(&session.prefix).unwrap();
     let mut seq = 0;
     while seq < count {
         match writer.try_push(&pattern(index, seq), session.stream, seq) {
-            Ok(()) => seq += 1,
+            Ok(()) => {
+                seq += 1;
+                if seq % 97 == 0 {
+                    cpu ^= 1;
+                    pin(cpus[cpu]);
+                }
+            }
             Err(PushError::Full) => spin_loop(),
             Err(PushError::TooLarge) => panic!("payload too large"),
         }
@@ -130,15 +139,15 @@ fn sequencer_and_players_end_to_end() {
     let (control_tx, control_rx) = mpsc::channel();
     let (retire_tx, retire_rx) = mpsc::channel();
     let (forward_tx, forward_rx) = mpsc::channel();
-    let kick_count = Arc::new(AtomicUsize::new(0));
+    let kicked_streams = Arc::new(Mutex::new(Vec::new()));
     let finish_count = Arc::new(AtomicUsize::new(0));
-    let relay_kicks = Arc::clone(&kick_count);
+    let relay_kicks = Arc::clone(&kicked_streams);
     let relay_finishes = Arc::clone(&finish_count);
     let relay = std::thread::spawn(move || {
         while let Ok(retire) = retire_rx.recv() {
             match retire {
-                Retire::Kicked { .. } => {
-                    relay_kicks.fetch_add(1, Ordering::Relaxed);
+                Retire::Kicked { slot, uid } => {
+                    relay_kicks.lock().unwrap().push(pack(slot, uid));
                 }
                 Retire::Finished { .. } => {
                     relay_finishes.fetch_add(1, Ordering::Relaxed);
@@ -210,7 +219,12 @@ fn sequencer_and_players_end_to_end() {
     assert!(seen[3].iter().copied().eq(0..seen[3].len() as u64));
     drop(fifo);
     relay.join().unwrap();
-    assert_eq!(kick_count.load(Ordering::Relaxed), 0);
+    for stream in kicked_streams.lock().unwrap().iter() {
+        assert!(
+            !streams[..3].contains(&Some(*stream)),
+            "friendly player was kicked: {stream}"
+        );
+    }
     assert_eq!(finish_count.load(Ordering::Relaxed), 3);
     listener.join().unwrap();
     std::fs::remove_file(socket).unwrap();

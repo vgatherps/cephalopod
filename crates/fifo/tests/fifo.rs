@@ -52,6 +52,30 @@ fn reorders_across_rings() {
 }
 
 #[test]
+fn batch_moves_to_the_next_ring() {
+    let reader = reader(64 * KIB);
+    let a = pack(1, 7);
+    let b = pack(2, 9);
+    for seq in 0..70 {
+        unsafe { reader.write_unchecked(0, a, seq, b"a") }.unwrap();
+    }
+    unsafe { reader.write_unchecked(1, b, 0, b"b") }.unwrap();
+    let (mut fifo, control, _retire) = setup(reader, 8);
+    control.send(Control::Open { slot: 1, uid: 7 }).unwrap();
+    control.send(Control::Open { slot: 2, uid: 9 }).unwrap();
+
+    let mut delivered = Vec::new();
+    while let Some(message) = fifo.next_message() {
+        delivered.push((message.stream(), message.seq()));
+    }
+
+    let mut expected = (0..64).map(|seq| (a, seq)).collect::<Vec<_>>();
+    expected.push((b, 0));
+    expected.extend((64..70).map(|seq| (a, seq)));
+    assert_eq!(delivered, expected);
+}
+
+#[test]
 fn kick_unblocks_the_ring() {
     let reader = reader(64 * KIB);
     let stuck = pack(1, 7);

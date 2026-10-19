@@ -491,7 +491,7 @@ impl Writer {
     #[cfg(target_os = "linux")]
     fn push(&self, payload: &[u8], stream: u64, seq: u64) -> Result<(), PushError> {
         let area = ThreadArea::current().expect("attach checked that rseq is registered");
-        if (area.cpu_id_start() as i32) < 0 {
+        if area.cpu_id() < 0 {
             panic!("rseq is not registered for this thread");
         }
         let mut small = [0_u8; 16];
@@ -554,7 +554,7 @@ fn write_record(
     let ring_size = ring.size as u64;
     let private = ring.private();
     let mut at = private.head.load(Relaxed);
-    while let Some(header) = ring.header(at, max_record) {
+    if let Some(header) = ring.header(at, max_record) {
         at += record_total(header.len as u64);
     }
     let total = record_total(payload.len() as u64);

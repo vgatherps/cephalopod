@@ -17,5 +17,5 @@ bench:           ## push benchmark
 clippy:          ## clippy for the Linux target, warnings are errors
 	cargo clippy --workspace --tests --examples --target aarch64-unknown-linux-gnu -- -D warnings
 
-check-x86:       ## cross-check the x86_64 target
-	cargo check --workspace --tests --examples --target x86_64-unknown-linux-gnu
+check-x86:       ## compile the tests for x86_64 under the amd64 image
+	PLATFORM=linux/amd64 $(LINUX) test --no-run --release --workspace
