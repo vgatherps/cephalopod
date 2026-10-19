@@ -193,11 +193,10 @@ impl Reader {
             ring_size.is_power_of_two() && ring_size % page_size() == 0,
             "ring_size {ring_size} must be a power of two and a multiple of the page size"
         );
-        // Equivalent to record_total(max_record) + 8 <= ring_size, written so a huge
-        // max_record cannot overflow the addition in record_total.
+        // The largest record plus the cleared tag word after it must fit in the ring.
         assert!(
             max_record <= ring_size - ceph_rseq::HEADER_LEN as usize - 8,
-            "record_total({max_record}) + 8 exceeds ring_size {ring_size}"
+            "max_record {max_record} does not fit in ring_size {ring_size}"
         );
         #[cfg(target_os = "linux")]
         let nr_rings = possible_cpus()?;

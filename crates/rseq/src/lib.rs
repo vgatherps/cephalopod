@@ -23,11 +23,10 @@ pub const LEN_OFFSET: usize = 8;
 pub const STREAM_OFFSET: usize = 16;
 pub const SEQ_OFFSET: usize = 24;
 
-/// Bytes a record with `len` payload bytes occupies: 32 + round_up(len, 8).
-///
-/// A push also reserves eight bytes after the record so it can clear the next tag word.
+/// Bytes a record with `len` payload bytes occupies: the header plus the payload padded to
+/// eight bytes.
 pub const fn record_total(len: u64) -> u64 {
-    (len + 39) & !7
+    HEADER_LEN + len.next_multiple_of(8)
 }
 
 /// The tag a committed record at `pos` carries.
