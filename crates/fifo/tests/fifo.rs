@@ -1,8 +1,6 @@
 #![cfg(target_os = "linux")]
 
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
 
 use ceph_fifo::Fifo;
 use ceph_proto::{Control, Retire, pack};
@@ -272,44 +270,20 @@ fn stalled_stream_is_kicked_under_traffic() {
     writer.try_push(b"stalled", stalled, 1).unwrap();
     writer.try_push(b"unblocked", unblocked, 0).unwrap();
 
-    let stop = AtomicBool::new(false);
-    let started = AtomicBool::new(false);
+    // One traffic record before every call: every sweep delivers something, so the global
+    // two-sweep rule never fires and only the per-stream age bound can free the unblocked
+    // stream. 16 KiB rings keep that bound small (about 140 sweeps here).
+    pin(&[b]);
     let mut delivered = false;
-    std::thread::scope(|scope| {
-        let producer = scope.spawn(|| {
-            pin(&[b]);
-            let deadline = Instant::now() + Duration::from_secs(20);
-            let mut seq = 0;
-            while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
-                match writer.try_push(b"traffic", traffic, seq) {
-                    Ok(()) => seq += 1,
-                    Err(PushError::Full) => {
-                        started.store(true, Ordering::Release);
-                        std::hint::spin_loop();
-                    }
-                    Err(PushError::TooLarge) => unreachable!(),
-                }
-            }
-        });
+    let mut seq = 0;
+    while !delivered && seq < 50_000 {
+        writer.try_push(b"traffic", traffic, seq).unwrap();
+        seq += 1;
+        let message = fifo.next().expect("the traffic record was committed");
+        delivered = message.stream() == unblocked && message.seq() == 0;
+    }
 
-        while !started.load(Ordering::Acquire) {
-            std::hint::spin_loop();
-        }
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !delivered && Instant::now() < deadline {
-            match fifo.next() {
-                Some(message) => {
-                    delivered = message.stream() == unblocked && message.seq() == 0;
-                    drop(message);
-                }
-                None => std::hint::spin_loop(),
-            }
-        }
-        stop.store(true, Ordering::Relaxed);
-        producer.join().unwrap();
-    });
-
-    assert!(delivered, "unblocked stream was not delivered within 10 seconds");
+    assert!(delivered, "unblocked stream was not delivered within 50000 traffic records");
     assert_eq!(
         retire_rx.try_recv(),
         Ok(Retire::Kicked { slot: 1, uid: 7 })
