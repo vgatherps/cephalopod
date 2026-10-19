@@ -273,7 +273,9 @@ impl Fifo {
         self.reader.poll(&mut self.ready);
     }
 
-    /// The front stream whose expected record is in no stalled ring's committed backlog.
+    /// The front stream whose expected record is in no stalled ring's committed backlog. If
+    /// every expected record is present, a producer committed its own records out of order;
+    /// the first stalled stream is dropped.
     fn victim(&self) -> (usize, u32) {
         let mut wanted = Vec::with_capacity(self.stalled.len());
         for &ring in &self.stalled {
@@ -302,10 +304,8 @@ impl Fifo {
         let stream = wanted
             .iter()
             .find(|candidate| !candidate.2)
-            .map(|candidate| candidate.0)
-            .unwrap_or_else(|| {
-                unreachable!("every stalled stream's expected record is committed")
-            });
+            .unwrap_or(&wanted[0])
+            .0;
         (slot(stream) as usize, uid(stream))
     }
 
