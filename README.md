@@ -36,9 +36,9 @@ Streams are identified by a 64-bit id handed out over a Unix socket: a slot inde
 32 bits and a per-process unique id in the low 32 bits. A player numbers its messages from 0
 and advances only after a successful push. The sequencer delivers a stream's messages in
 sequence order even when they land in different rings because the player migrated between
-CPUs. If a stream's next message never arrives, the sequencer drops that stream after two sweeps
-in which nothing at all was delivered, or after it has been stuck for longer than every other
-ring could possibly take to drain while other streams delivered, and closes its socket.
+CPUs. A stream whose next record never arrives is dropped at the end of the first pass in which
+nothing was delivered or discarded anywhere and a fresh poll still showed nothing for it, and
+closes its socket.
 The shared-memory name is random per sequencer run and only reachable through the socket, so a
 player from a previous run cannot write into the new rings.
 

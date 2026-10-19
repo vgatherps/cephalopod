@@ -221,10 +221,6 @@ impl Reader {
             .expect("generated shm name starts with a slash")
     }
 
-    pub fn ring_size(&self) -> usize {
-        self.map.ring_size
-    }
-
     /// Appends to `out` every ring whose current tail appears to hold a committed record. This
     /// is only a hint: `front` and `view` perform the Acquire load required before consuming a
     /// record.

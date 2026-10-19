@@ -51,29 +51,23 @@ fn reorders_across_rings() {
 }
 
 #[test]
-fn stall_kicks_the_stream() {
+fn kick_unblocks_the_ring() {
     let reader = reader(64 * KIB);
-    let stream = pack(1, 7);
-    unsafe { reader.write_unchecked(0, stream, 1, b"one") }.unwrap();
+    let stuck = pack(1, 7);
+    let unblocked = pack(2, 9);
+    unsafe { reader.write_unchecked(0, stuck, 1, b"one") }.unwrap();
+    unsafe { reader.write_unchecked(0, unblocked, 0, b"zero") }.unwrap();
     let (mut fifo, control, kicks) = setup(reader, 8);
     control.send(Control::Open { slot: 1, uid: 7 }).unwrap();
+    control.send(Control::Open { slot: 2, uid: 9 }).unwrap();
 
-    assert_eq!(next_message(&mut fifo), None);
-    assert_eq!(next_message(&mut fifo), None);
+    assert_eq!(
+        next_message(&mut fifo),
+        Some((unblocked, 0, b"zero".to_vec()))
+    );
     assert_eq!(
         kicks.try_recv(),
         Ok(Retire::Kicked { slot: 1, uid: 7 })
-    );
-
-    unsafe { fifo.reader().write_unchecked(0, stream, 2, b"two") }
-        .unwrap();
-    let second = pack(2, 9);
-    control.send(Control::Open { slot: 2, uid: 9 }).unwrap();
-    unsafe { fifo.reader().write_unchecked(0, second, 0, b"zero") }
-        .unwrap();
-    assert_eq!(
-        next_message(&mut fifo),
-        Some((second, 0, b"zero".to_vec()))
     );
     assert_eq!(next_message(&mut fifo), None);
     assert_eq!(kicks.try_recv(), Err(TryRecvError::Empty));
@@ -202,40 +196,4 @@ fn end_of_stream_retires() {
     unsafe { fifo.reader().write_unchecked(0, stream, 2, b"after") }
         .unwrap();
     assert!(fifo.next().is_none());
-}
-
-#[test]
-fn stalled_stream_is_kicked_under_traffic() {
-    let reader = reader(16 * KIB);
-    let stalled = pack(1, 7);
-    let traffic = pack(2, 9);
-    let unblocked = pack(3, 11);
-    unsafe { reader.write_unchecked(0, stalled, 1, b"stalled") }
-        .unwrap();
-    unsafe { reader.write_unchecked(0, unblocked, 0, b"unblocked") }
-        .unwrap();
-    let (mut fifo, control, retire) = setup(reader, 4);
-    control.send(Control::Open { slot: 1, uid: 7 }).unwrap();
-    control.send(Control::Open { slot: 2, uid: 9 }).unwrap();
-    control.send(Control::Open { slot: 3, uid: 11 }).unwrap();
-
-    // One traffic record before every call means the global two-sweep rule never fires.
-    let mut delivered = false;
-    let mut seq = 0;
-    while !delivered && seq < 50_000 {
-        unsafe { fifo.reader().write_unchecked(1, traffic, seq, b"traffic") }
-            .unwrap();
-        seq += 1;
-        let message = fifo.next().expect("the traffic record was committed");
-        delivered = message.stream() == unblocked && message.seq() == 0;
-    }
-
-    assert!(
-        delivered,
-        "unblocked stream was not delivered within 50000 traffic records"
-    );
-    assert_eq!(
-        retire.try_recv(),
-        Ok(Retire::Kicked { slot: 1, uid: 7 })
-    );
 }

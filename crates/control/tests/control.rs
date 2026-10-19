@@ -2,8 +2,10 @@ use ceph_control::{Listener, connect};
 use ceph_proto::{Control, Retire, pack};
 use std::fs;
 use std::os::unix::net::UnixStream;
+use std::os::unix::thread::JoinHandleExt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -103,6 +105,52 @@ fn kick_closes_the_player() {
     drop(control_rx);
     drop(kick_tx);
     thread.join().unwrap();
+    fs::remove_file(&path).unwrap();
+    fs::remove_dir(path.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn retire_is_applied_while_signals_arrive() {
+    extern "C" fn noop(_: libc::c_int) {}
+
+    let handler: extern "C" fn(libc::c_int) = noop;
+    let previous = unsafe { libc::signal(libc::SIGUSR2, handler as libc::sighandler_t) };
+    let path = socket_path();
+    let (control_tx, control_rx) = mpsc::channel();
+    let (retire_tx, retire_rx) = mpsc::channel();
+    let listener = Listener::bind(&path, "ceph-test", 1, control_tx, retire_rx).unwrap();
+    let listener_thread = thread::spawn(move || listener.run().unwrap());
+    let listener_pthread = listener_thread.as_pthread_t();
+    let session = connect(&path).unwrap();
+    assert_eq!(
+        control_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        Control::Open { slot: 0, uid: 1 }
+    );
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let flood_stop = Arc::clone(&stop);
+    let flood = thread::spawn(move || {
+        while !flood_stop.load(Ordering::Relaxed) {
+            unsafe { libc::pthread_kill(listener_pthread, libc::SIGUSR2) };
+            thread::sleep(Duration::from_micros(100));
+        }
+    });
+    retire_tx
+        .send(Retire::Finished { slot: 0, uid: 1 })
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !session.closed() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(1));
+    }
+    let closed = session.closed();
+    stop.store(true, Ordering::Relaxed);
+    flood.join().unwrap();
+    assert!(closed);
+
+    drop(control_rx);
+    drop(retire_tx);
+    listener_thread.join().unwrap();
+    unsafe { libc::signal(libc::SIGUSR2, previous) };
     fs::remove_file(&path).unwrap();
     fs::remove_dir(path.parent().unwrap()).unwrap();
 }
