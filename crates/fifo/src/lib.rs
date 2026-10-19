@@ -1,7 +1,7 @@
 use std::sync::mpsc::{Receiver, Sender};
 
-use ceph_proto::{Control, Kick, slot, uid};
-use ceph_ring::Reader;
+use ceph_proto::{Control, Retire, slot, uid};
+use ceph_ring::{END_OF_STREAM, Reader};
 
 const BATCH: usize = 64;
 
@@ -10,7 +10,9 @@ pub struct Message<'a> {
     seq: u64,
     payload: *const [u8],
     ring: usize,
+    finish: Option<Retire>,
     reader: &'a mut Reader,
+    retire: &'a Sender<Retire>,
 }
 
 impl Message<'_> {
@@ -20,6 +22,11 @@ impl Message<'_> {
 
     pub fn seq(&self) -> u64 {
         self.seq
+    }
+
+    /// Whether this is the stream's last record. Its payload is empty by convention.
+    pub fn end(&self) -> bool {
+        self.finish.is_some()
     }
 
     pub fn payload(&self) -> &[u8] {
@@ -32,6 +39,9 @@ impl Message<'_> {
 impl Drop for Message<'_> {
     fn drop(&mut self) {
         self.reader.advance(self.ring);
+        if let Some(retire) = self.finish {
+            let _ = self.retire.send(retire);
+        }
     }
 }
 
@@ -52,7 +62,7 @@ pub struct Fifo {
     delivered: bool,
     empty_sweeps: u32,
     control: Receiver<Control>,
-    kicks: Sender<Kick>,
+    retire: Sender<Retire>,
 }
 
 impl Fifo {
@@ -60,7 +70,7 @@ impl Fifo {
         reader: Reader,
         max_streams: u32,
         control: Receiver<Control>,
-        kicks: Sender<Kick>,
+        retire: Sender<Retire>,
     ) -> Fifo {
         Fifo {
             reader,
@@ -72,7 +82,7 @@ impl Fifo {
             delivered: false,
             empty_sweeps: 0,
             control,
-            kicks,
+            retire,
         }
     }
 
@@ -110,12 +120,14 @@ impl Fifo {
                 }
             }
 
+            let seq = header.seq & !END_OF_STREAM;
+            let end = header.seq & END_OF_STREAM != 0;
             let state = self.slots[index];
-            if !state.live || header.seq < state.expected {
+            if !state.live || seq < state.expected {
                 self.reader.advance(ring);
                 continue;
             }
-            if header.seq > state.expected {
+            if seq > state.expected {
                 self.stopped = true;
                 self.pos += 1;
                 self.batch = 0;
@@ -123,13 +135,19 @@ impl Fifo {
             }
 
             self.slots[index].expected += 1;
+            let finish = end.then(|| {
+                self.slots[index].live = false;
+                Retire::Finished {
+                    slot: index as u32,
+                    uid: state.uid,
+                }
+            });
             self.delivered = true;
             self.count_record();
-            let (stream, seq, payload) = {
+            let (stream, payload) = {
                 let record = self.reader.view(ring);
                 (
                     record.stream,
-                    record.seq,
                     std::ptr::slice_from_raw_parts(record.payload.as_ptr(), record.payload.len()),
                 )
             };
@@ -138,7 +156,9 @@ impl Fifo {
                 seq,
                 payload,
                 ring,
+                finish,
                 reader: &mut self.reader,
+                retire: &self.retire,
             });
         }
     }
@@ -178,19 +198,16 @@ impl Fifo {
         while let Ok(message) = self.control.try_recv() {
             match message {
                 Control::Open { slot, uid } => {
-                    if let Some(state) = self.slots.get_mut(slot as usize) {
-                        *state = Slot {
-                            uid,
-                            expected: 0,
-                            live: true,
-                        };
-                    }
+                    self.slots[slot as usize] = Slot {
+                        uid,
+                        expected: 0,
+                        live: true,
+                    };
                 }
                 Control::Close { slot, uid } => {
-                    if let Some(state) = self.slots.get_mut(slot as usize) {
-                        if state.uid == uid {
-                            state.live = false;
-                        }
+                    let state = &mut self.slots[slot as usize];
+                    if state.uid == uid {
+                        state.live = false;
                     }
                 }
             }
@@ -207,9 +224,10 @@ impl Fifo {
                 continue;
             };
             let stream_uid = uid(header.stream);
-            if state.live && state.uid == stream_uid && header.seq > state.expected {
+            let seq = header.seq & !END_OF_STREAM;
+            if state.live && state.uid == stream_uid && seq > state.expected {
                 state.live = false;
-                let _ = self.kicks.send(Kick {
+                let _ = self.retire.send(Retire::Kicked {
                     slot: index as u32,
                     uid: stream_uid,
                 });
@@ -219,10 +237,11 @@ impl Fifo {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
-    use ceph_ring::Config;
+    use ceph_proto::pack;
+    use ceph_ring::{Config, Writer};
     use std::sync::mpsc;
 
     #[test]
@@ -238,23 +257,35 @@ mod tests {
             },
         )
         .unwrap();
-        let (_control_tx, control_rx) = mpsc::channel();
-        let (kick_tx, kick_rx) = mpsc::channel();
-        let mut fifo = Fifo::new(reader, 1, control_rx, kick_tx);
+        let writer = Writer::attach(&prefix).unwrap();
+        let (control_tx, control_rx) = mpsc::channel();
+        let (retire_tx, retire_rx) = mpsc::channel();
+        let mut fifo = Fifo::new(reader, 1, control_rx, retire_tx);
+        control_tx.send(Control::Open { slot: 0, uid: 7 }).unwrap();
+        writer.try_push(b"one", pack(0, 7), 1).unwrap();
 
+        fifo.start_sweep();
+        let header = fifo.reader.front(fifo.ready[0]).unwrap();
+        assert_eq!(header.seq, 1);
+        assert!(header.seq > fifo.slots[0].expected);
         fifo.stopped = true;
+        fifo.pos = fifo.ready.len();
         fifo.finish_sweep();
+        fifo.start_sweep();
         assert_eq!(fifo.empty_sweeps, 1);
-        assert_eq!(
-            kick_rx.try_recv(),
-            Err(mpsc::TryRecvError::Empty)
-        );
+        assert_eq!(retire_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
 
+        let header = fifo.reader.front(fifo.ready[0]).unwrap();
+        assert_eq!(header.seq, 1);
+        assert!(header.seq > fifo.slots[0].expected);
+        fifo.stopped = true;
+        fifo.pos = fifo.ready.len();
         fifo.finish_sweep();
+        fifo.start_sweep();
         assert_eq!(fifo.empty_sweeps, 0);
         assert_eq!(
-            kick_rx.try_recv(),
-            Err(mpsc::TryRecvError::Empty)
+            retire_rx.try_recv(),
+            Ok(Retire::Kicked { slot: 0, uid: 7 })
         );
     }
 }

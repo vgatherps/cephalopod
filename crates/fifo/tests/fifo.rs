@@ -3,7 +3,7 @@
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 
 use ceph_fifo::Fifo;
-use ceph_proto::{Control, Kick, pack};
+use ceph_proto::{Control, Retire, pack};
 use ceph_ring::{Config, PushError, Reader, Writer};
 
 const KIB: usize = 1024;
@@ -40,7 +40,7 @@ fn pin(cpus: &[usize]) {
     }
 }
 
-fn setup(test: &str) -> (Writer, Fifo, Sender<Control>, Receiver<Kick>) {
+fn setup(test: &str) -> (Writer, Fifo, Sender<Control>, Receiver<Retire>) {
     let prefix = prefix(test);
     let reader = Reader::create(
         &prefix,
@@ -52,9 +52,9 @@ fn setup(test: &str) -> (Writer, Fifo, Sender<Control>, Receiver<Kick>) {
     .unwrap();
     let writer = Writer::attach(&prefix).unwrap();
     let (control_tx, control_rx) = mpsc::channel();
-    let (kick_tx, kick_rx) = mpsc::channel();
-    let fifo = Fifo::new(reader, 8, control_rx, kick_tx);
-    (writer, fifo, control_tx, kick_rx)
+    let (retire_tx, retire_rx) = mpsc::channel();
+    let fifo = Fifo::new(reader, 8, control_rx, retire_tx);
+    (writer, fifo, control_tx, retire_rx)
 }
 
 fn next_message(fifo: &mut Fifo) -> Option<(u64, u64, Vec<u8>)> {
@@ -98,7 +98,10 @@ fn stall_kicks_the_stream() {
 
     assert_eq!(next_message(&mut fifo), None);
     assert_eq!(next_message(&mut fifo), None);
-    assert_eq!(kicks.try_recv(), Ok(Kick { slot: 1, uid: 7 }));
+    assert_eq!(
+        kicks.try_recv(),
+        Ok(Retire::Kicked { slot: 1, uid: 7 })
+    );
 
     writer.try_push(b"two", stream, 2).unwrap();
     let second = pack(2, 9);
@@ -167,42 +170,26 @@ fn held_message_blocks_publish() {
 }
 
 #[test]
-fn open_after_sweep_started() {
-    let (writer, mut fifo, control, _kicks) = setup("open-after-sweep");
+fn old_uid_is_discarded() {
+    let (writer, mut fifo, control, _kicks) = setup("old-uid");
     let cpus = allowed_cpus();
     assert!(cpus.len() >= 2);
-    let first = pack(1, 7);
-    let second = pack(2, 9);
+    let old_stream = pack(1, 7);
+    let new_stream = pack(1, 8);
+    let late_stream = pack(2, 9);
     control.send(Control::Open { slot: 1, uid: 7 }).unwrap();
-
     pin(&[cpus[0]]);
-    writer.try_push(b"first", first, 0).unwrap();
+    writer.try_push(b"old zero", old_stream, 0).unwrap();
     pin(&[cpus[1]]);
-    writer.try_push(b"second", second, 0).unwrap();
-
+    writer.try_push(b"late open", late_stream, 0).unwrap();
     assert_eq!(
         next_message(&mut fifo),
-        Some((first, 0, b"first".to_vec()))
+        Some((old_stream, 0, b"old zero".to_vec()))
     );
     control.send(Control::Open { slot: 2, uid: 9 }).unwrap();
     assert_eq!(
         next_message(&mut fifo),
-        Some((second, 0, b"second".to_vec()))
-    );
-}
-
-#[test]
-fn old_uid_is_discarded() {
-    let (writer, mut fifo, control, _kicks) = setup("old-uid");
-    let cpu = allowed_cpus()[0];
-    let old_stream = pack(1, 7);
-    let new_stream = pack(1, 8);
-    control.send(Control::Open { slot: 1, uid: 7 }).unwrap();
-    pin(&[cpu]);
-    writer.try_push(b"old zero", old_stream, 0).unwrap();
-    assert_eq!(
-        next_message(&mut fifo),
-        Some((old_stream, 0, b"old zero".to_vec()))
+        Some((late_stream, 0, b"late open".to_vec()))
     );
 
     control.send(Control::Close { slot: 1, uid: 7 }).unwrap();
@@ -211,6 +198,7 @@ fn old_uid_is_discarded() {
     // Control messages are drained at a sweep boundary or when a front record's uid does not
     // match its slot. The new stream's record goes first so that rule fires; the old stream's
     // record behind it must then be discarded.
+    pin(&[cpus[0]]);
     writer.try_push(b"new zero", new_stream, 0).unwrap();
     writer.try_push(b"old one", old_stream, 1).unwrap();
 
@@ -219,4 +207,36 @@ fn old_uid_is_discarded() {
         Some((new_stream, 0, b"new zero".to_vec()))
     );
     assert_eq!(next_message(&mut fifo), None);
+}
+
+#[test]
+fn end_of_stream_retires() {
+    let (writer, mut fifo, control, retire) = setup("end-of-stream");
+    let cpu = allowed_cpus()[0];
+    let stream = pack(1, 7);
+    control.send(Control::Open { slot: 1, uid: 7 }).unwrap();
+    pin(&[cpu]);
+    writer.try_push(b"zero", stream, 0).unwrap();
+    writer.try_finish(stream, 1).unwrap();
+
+    let first = fifo.next().unwrap();
+    assert_eq!((first.stream(), first.seq()), (stream, 0));
+    assert!(!first.end());
+    assert_eq!(first.payload(), b"zero");
+    drop(first);
+
+    let last = fifo.next().unwrap();
+    assert_eq!((last.stream(), last.seq()), (stream, 1));
+    assert!(last.end());
+    assert!(last.payload().is_empty());
+    assert_eq!(retire.try_recv(), Err(TryRecvError::Empty));
+    drop(last);
+    assert_eq!(
+        retire.try_recv(),
+        Ok(Retire::Finished { slot: 1, uid: 7 })
+    );
+    assert!(fifo.next().is_none());
+
+    writer.try_push(b"after", stream, 2).unwrap();
+    assert!(fifo.next().is_none());
 }

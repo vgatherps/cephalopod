@@ -1,5 +1,5 @@
 use ceph_control::{Listener, connect};
-use ceph_proto::{Control, Kick, pack};
+use ceph_proto::{Control, Retire, pack};
 use std::fs;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -86,7 +86,9 @@ fn kick_closes_the_player() {
         control_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
         Control::Open { slot: 0, uid: 1 }
     );
-    kick_tx.send(Kick { slot: 0, uid: 1 }).unwrap();
+    kick_tx
+        .send(Retire::Kicked { slot: 0, uid: 1 })
+        .unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(1);
     while !session.closed() && Instant::now() < deadline {

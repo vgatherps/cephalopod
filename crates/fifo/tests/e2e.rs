@@ -1,6 +1,7 @@
 #![cfg(target_os = "linux")]
 
 use std::hint::spin_loop;
+use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -9,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use ceph_control::{Listener, connect};
 use ceph_fifo::Fifo;
+use ceph_proto::Retire;
 use ceph_ring::{Config, PushError, Reader, Writer};
 
 const CHILD_ENV: &str = "CEPH_E2E_CHILD";
@@ -66,12 +68,38 @@ fn run_child(spec: &str) {
             Err(PushError::TooLarge) => panic!("payload too large"),
         }
     }
+    loop {
+        match writer.try_finish(session.stream, count) {
+            Ok(()) => break,
+            Err(PushError::Full) => spin_loop(),
+            Err(PushError::TooLarge) => unreachable!(),
+        }
+    }
+    while !session.closed() {
+        spin_loop();
+    }
 }
 
-fn take(fifo: &mut Fifo, seen: &mut [Vec<u64>], streams: &mut [Option<u64>]) -> bool {
+fn take(
+    fifo: &mut Fifo,
+    seen: &mut [Vec<u64>],
+    streams: &mut [Option<u64>],
+    ended: &mut [bool],
+) -> bool {
     let Some(message) = fifo.next() else {
         return false;
     };
+    if message.end() {
+        let index = streams
+            .iter()
+            .position(|stream| *stream == Some(message.stream()))
+            .expect("end-of-stream record must follow the stream's data");
+        assert_eq!(message.seq(), seen[index].len() as u64, "child {index}");
+        assert!(message.payload().is_empty(), "child {index}");
+        assert!(!ended[index], "child {index} ended twice");
+        ended[index] = true;
+        return true;
+    }
     let payload = message.payload();
     let index = u64::from_le_bytes(payload[..8].try_into().unwrap()) as usize;
     assert!(index < CHILDREN, "unknown child {index}");
@@ -81,6 +109,7 @@ fn take(fifo: &mut Fifo, seen: &mut [Vec<u64>], streams: &mut [Option<u64>]) -> 
         assert!(!streams.contains(&Some(message.stream())), "stream reused");
         streams[index] = Some(message.stream());
     }
+    assert!(!ended[index], "child {index} sent data after end-of-stream");
     assert_eq!(message.seq(), seen[index].len() as u64, "child {index}");
     assert_eq!(payload, pattern(index, message.seq()), "child {index}");
     seen[index].push(message.seq());
@@ -103,27 +132,42 @@ fn sequencer_and_players_end_to_end() {
     )
     .unwrap();
     let (control_tx, control_rx) = mpsc::channel();
-    let (kick_tx, kick_rx) = mpsc::channel();
+    let (retire_tx, retire_rx) = mpsc::channel();
     let (forward_tx, forward_rx) = mpsc::channel();
     let kick_count = Arc::new(AtomicUsize::new(0));
-    let relay_count = Arc::clone(&kick_count);
+    let finish_count = Arc::new(AtomicUsize::new(0));
+    let relay_kicks = Arc::clone(&kick_count);
+    let relay_finishes = Arc::clone(&finish_count);
     let relay = std::thread::spawn(move || {
-        while let Ok(kick) = kick_rx.recv() {
-            relay_count.fetch_add(1, Ordering::Relaxed);
-            forward_tx.send(kick).unwrap();
+        while let Ok(retire) = retire_rx.recv() {
+            match retire {
+                Retire::Kicked { .. } => {
+                    relay_kicks.fetch_add(1, Ordering::Relaxed);
+                }
+                Retire::Finished { .. } => {
+                    relay_finishes.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            forward_tx.send(retire).unwrap();
         }
     });
     let listener = Listener::bind(Path::new(&socket), &prefix, 16, control_tx, forward_rx)
         .unwrap();
     let listener = std::thread::spawn(move || listener.run().unwrap());
-    let mut fifo = Fifo::new(reader, 16, control_rx, kick_tx);
+    let mut fifo = Fifo::new(reader, 16, control_rx, retire_tx);
     let exe = std::env::current_exe().unwrap();
     let mut children: Vec<_> = (0..CHILDREN)
         .map(|index| {
             Some(
                 Command::new(&exe)
                     .args(["sequencer_and_players_end_to_end", "--exact", "--nocapture"])
-                    .env(CHILD_ENV, format!("{socket} {index} {COUNT}"))
+                    .env(
+                        CHILD_ENV,
+                        format!(
+                            "{socket} {index} {}",
+                            if index == 3 { u64::MAX } else { COUNT }
+                        ),
+                    )
                     .stdout(Stdio::null())
                     .spawn()
                     .unwrap(),
@@ -132,21 +176,26 @@ fn sequencer_and_players_end_to_end() {
         .collect();
     let mut seen = vec![Vec::new(); CHILDREN];
     let mut streams = [None; CHILDREN];
+    let mut ended = [false; CHILDREN];
     let mut killed = false;
     let deadline = Instant::now() + Duration::from_secs(30);
-    while !(seen[..3].iter().all(|items| items.len() == COUNT as usize) && killed) {
+    while !(seen[..3].iter().all(|items| items.len() == COUNT as usize)
+        && ended[..3].iter().all(|end| *end)
+        && killed)
+    {
         assert!(
             Instant::now() < deadline,
             "players stalled: {:?}",
             seen.iter().map(Vec::len).collect::<Vec<_>>()
         );
-        if !take(&mut fifo, &mut seen, &mut streams) {
+        if !take(&mut fifo, &mut seen, &mut streams, &mut ended) {
             spin_loop();
         }
         if !killed && seen[3].len() >= 100 {
             let mut child = children[3].take().unwrap();
             child.kill().unwrap();
-            assert!(!child.wait().unwrap().success(), "killed child exited successfully");
+            let status = child.wait().unwrap();
+            assert_eq!(status.signal(), Some(libc::SIGKILL), "child 3: {status}");
             killed = true;
         }
     }
@@ -155,7 +204,9 @@ fn sequencer_and_players_end_to_end() {
         assert!(status.success(), "child {index}: {status}");
     }
     let drain_deadline = Instant::now() + Duration::from_secs(1);
-    while Instant::now() < drain_deadline && take(&mut fifo, &mut seen, &mut streams) {}
+    while Instant::now() < drain_deadline
+        && take(&mut fifo, &mut seen, &mut streams, &mut ended)
+    {}
     for (index, items) in seen[..3].iter().enumerate() {
         assert!(items.iter().copied().eq(0..COUNT), "child {index}");
     }
@@ -164,6 +215,7 @@ fn sequencer_and_players_end_to_end() {
     drop(fifo);
     relay.join().unwrap();
     assert_eq!(kick_count.load(Ordering::Relaxed), 0);
+    assert_eq!(finish_count.load(Ordering::Relaxed), 3);
     listener.join().unwrap();
     std::fs::remove_file(socket).unwrap();
 }

@@ -22,9 +22,10 @@ pub enum Control {
     Close { slot: u32, uid: u32 },
 }
 
-/// Polling thread to control thread: this stream stalled and was dropped.
+/// Polling thread to control thread. The control thread closes the socket and frees the slot in
+/// both cases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Kick {
-    pub slot: u32,
-    pub uid: u32,
+pub enum Retire {
+    Kicked { slot: u32, uid: u32 },
+    Finished { slot: u32, uid: u32 },
 }

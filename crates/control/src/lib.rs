@@ -1,4 +1,4 @@
-use ceph_proto::{Control, Kick, pack};
+use ceph_proto::{Control, Retire, pack};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -12,7 +12,7 @@ pub struct Listener {
     live: Vec<Option<(u32, UnixStream)>>,
     next_uid: u32,
     control: Sender<Control>,
-    kicks: Receiver<Kick>,
+    retire: Receiver<Retire>,
 }
 
 impl Listener {
@@ -21,7 +21,7 @@ impl Listener {
         prefix: &str,
         max_streams: u32,
         control: Sender<Control>,
-        kicks: Receiver<Kick>,
+        retire: Receiver<Retire>,
     ) -> io::Result<Listener> {
         let prefix = prefix.as_bytes().to_vec();
         if u16::try_from(prefix.len()).is_err() {
@@ -46,7 +46,7 @@ impl Listener {
             live,
             next_uid: 1,
             control,
-            kicks,
+            retire,
         })
     }
 
@@ -88,32 +88,33 @@ impl Listener {
             for (index, slot) in slots.into_iter().enumerate() {
                 let revents = pollfds[index + 1].revents;
                 if revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
-                    let mut buffer = [0_u8; 16];
-                    if let Some((uid, mut socket)) = self.live[slot as usize].take() {
-                        let _ = socket.read(&mut buffer);
-                        self.free.push(slot);
-                        if self.control.send(Control::Close { slot, uid }).is_err() {
-                            return Ok(());
-                        }
+                    // Players never send after connecting, so any readable event means the player is gone.
+                    let (uid, socket) = self.live[slot as usize]
+                        .take()
+                        .expect("polled slot must still be live");
+                    drop(socket);
+                    self.free.push(slot);
+                    if self.control.send(Control::Close { slot, uid }).is_err() {
+                        return Ok(());
                     }
                 }
             }
 
             loop {
-                match self.kicks.try_recv() {
-                    Ok(kick) => {
-                        let Some(entry) = self.live.get_mut(kick.slot as usize) else {
-                            continue;
+                match self.retire.try_recv() {
+                    Ok(retire) => {
+                        let (slot, uid) = match retire {
+                            Retire::Kicked { slot, uid } | Retire::Finished { slot, uid } => {
+                                (slot, uid)
+                            }
                         };
-                        if entry.as_ref().is_some_and(|(uid, _)| *uid == kick.uid) {
+                        let entry = &mut self.live[slot as usize];
+                        if entry.as_ref().is_some_and(|(live_uid, _)| *live_uid == uid) {
                             *entry = None;
-                            self.free.push(kick.slot);
+                            self.free.push(slot);
                             if self
                                 .control
-                                .send(Control::Close {
-                                    slot: kick.slot,
-                                    uid: kick.uid,
-                                })
+                                .send(Control::Close { slot, uid })
                                 .is_err()
                             {
                                 return Ok(());
@@ -149,6 +150,7 @@ impl Listener {
             self.next_uid = self.next_uid.checked_add(1).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::Other, "stream uid space exhausted")
             })?;
+            // `Open` goes before the reply so a player's first record can never precede it; a reply failure therefore sends the matching `Close`.
             if self.control.send(Control::Open { slot, uid }).is_err() {
                 return Ok(false);
             }

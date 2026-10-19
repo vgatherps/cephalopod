@@ -17,6 +17,9 @@ const TAILS_OFFSET: usize = 4096;
 // Spread initial tag words across L1 cache sets.
 const STAGGER: u64 = 128;
 
+/// Set in a record's `seq` to mark the stream's last record. Sequence numbers are below 2^63.
+pub const END_OF_STREAM: u64 = 1 << 63;
+
 #[repr(C)]
 struct ShmHeader {
     magic: AtomicU64,
@@ -112,12 +115,6 @@ impl Map {
         };
         (base, private, tail)
     }
-
-    #[cfg(not(target_os = "linux"))]
-    fn lock(&self) -> &AtomicU32 {
-        // SAFETY: `ShmHeader` starts at the beginning of the metadata mapping.
-        unsafe { &(*self.meta.cast::<ShmHeader>()).lock }
-    }
 }
 
 impl Drop for Map {
@@ -208,7 +205,7 @@ impl Reader {
     }
 
     /// Appends to `out` every ring whose current tail appears to hold a committed record. This
-    /// is only a hint: `front` and `read` perform the Acquire load required before consuming a
+    /// is only a hint: `front` and `view` perform the Acquire load required before consuming a
     /// record.
     pub fn poll(&self, out: &mut Vec<usize>) {
         let mask = self.map.ring_size as u64 - 1;
@@ -305,7 +302,11 @@ impl Reader {
     /// Release-stores every local tail that moved since the previous publish.
     pub fn publish(&mut self) {
         for ring in 0..self.nr_rings() {
-            self.publish_ring(ring);
+            if self.dirty[ring] {
+                let (_, _, shared_tail) = self.map.ring(ring);
+                shared_tail.store(self.tails[ring], Release);
+                self.dirty[ring] = false;
+            }
         }
     }
 
@@ -314,14 +315,6 @@ impl Reader {
         let mask = self.map.ring_size as u64 - 1;
         // The ring is mapped twice, so a record can cross its physical end contiguously.
         unsafe { base.add((tail & mask) as usize) }
-    }
-
-    fn publish_ring(&mut self, ring: usize) {
-        if self.dirty[ring] {
-            let (_, _, shared_tail) = self.map.ring(ring);
-            shared_tail.store(self.tails[ring], Release);
-            self.dirty[ring] = false;
-        }
     }
 }
 
@@ -401,6 +394,11 @@ impl Writer {
         self.push(payload, stream, seq)
     }
 
+    /// Pushes the stream's last record with an empty payload.
+    pub fn try_finish(&self, stream: u64, seq: u64) -> Result<(), PushError> {
+        self.try_push(&[], stream, seq | END_OF_STREAM)
+    }
+
     #[cfg(target_os = "linux")]
     fn push(&self, payload: &[u8], stream: u64, seq: u64) -> Result<(), PushError> {
         let ring_size = self.map.ring_size as u64;
@@ -408,6 +406,7 @@ impl Writer {
         loop {
             let area = ThreadArea::current().expect("attach checked that rseq is registered");
             let cpu = area.cpu_id_start();
+            // `nr_rings` is the number of possible CPUs, so every `cpu_id` indexes in range.
             let (base, private, tail) = self.map.ring(cpu as usize);
             // SAFETY: `private` is CPU `cpu`'s aligned private line, `base` is its double-mapped
             // ring, and create ensures the record plus its following tag word fit in the mapping.
@@ -452,7 +451,8 @@ impl Writer {
         });
         let ring_size = self.map.ring_size as u64;
         let (base, private, tail) = self.map.ring(0);
-        let lock = self.map.lock();
+        // SAFETY: `ShmHeader` starts at the beginning of the metadata mapping.
+        let lock = unsafe { &(*self.map.meta.cast::<ShmHeader>()).lock };
         while lock.compare_exchange(0, 1, Acquire, Relaxed).is_err() {
             std::hint::spin_loop();
         }
