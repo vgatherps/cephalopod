@@ -208,6 +208,10 @@ impl Reader {
         self.tails.len()
     }
 
+    pub fn ring_size(&self) -> usize {
+        self.map.ring_size
+    }
+
     /// Appends to `out` every ring whose current tail appears to hold a committed record. This
     /// is only a hint: `front` and `view` perform the Acquire load required before consuming a
     /// record.
@@ -398,7 +402,8 @@ impl Writer {
         self.push(payload, stream, seq)
     }
 
-    /// Pushes the stream's last record with an empty payload.
+    /// Pushes the stream's last record with an empty payload. The player must keep its socket
+    /// open until the sequencer closes it; `try_finish` only enqueues the end record.
     pub fn try_finish(&self, stream: u64, seq: u64) -> Result<(), PushError> {
         self.try_push(&[], stream, seq | END_OF_STREAM)
     }
@@ -407,8 +412,11 @@ impl Writer {
     fn push(&self, payload: &[u8], stream: u64, seq: u64) -> Result<(), PushError> {
         let ring_size = self.map.ring_size as u64;
         let mut refreshed = None;
+        let area = ThreadArea::current().expect("attach checked that rseq is registered");
+        if (area.cpu_id_start() as i32) < 0 {
+            panic!("rseq is not registered for this thread");
+        }
         loop {
-            let area = ThreadArea::current().expect("attach checked that rseq is registered");
             let cpu = area.cpu_id_start();
             // `nr_rings` is the number of possible CPUs, so every `cpu_id` indexes in range.
             let (base, private, tail) = self.map.ring(cpu as usize);

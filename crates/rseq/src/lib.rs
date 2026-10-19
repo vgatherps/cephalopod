@@ -37,8 +37,8 @@ pub const fn tag_for(pos: u64) -> u64 {
 
 /// One CPU's private cached head and consumer tail.
 ///
-/// `head` is only touched inside [`push_record`]. `tail` is read inside `push_record` and
-/// written by the caller on refresh with a Release store.
+/// `head` is written by `Reader::create` once, then only inside [`push_record`] on this CPU.
+/// `tail` is read inside `push_record` and written by the caller on refresh with a Release store.
 #[repr(C, align(128))]
 pub struct Private {
     pub head: AtomicU64,
@@ -124,6 +124,11 @@ pub enum Push {
 /// The record goes at `base + (pos & (ring_size - 1))`, where `pos` is the position after the
 /// cached-head walk. Its 32-byte header contains the position tag, payload length, stream, and
 /// sequence number, followed by `len` payload bytes and unwritten padding to a multiple of 8.
+///
+/// The cached-tail check relies on ordering: the in-section plain load of `private.tail` is
+/// followed only by stores that depend on the room-check branch. Both supported architectures
+/// order those stores after the load through this control dependency. The branch must remain
+/// between that load and every store to the ring.
 ///
 /// How the critical section works:
 ///

@@ -36,12 +36,14 @@ Streams are identified by a 64-bit id handed out over a Unix socket: a slot inde
 32 bits and a per-process unique id in the low 32 bits. A player numbers its messages from 0
 and advances only after a successful push. The sequencer delivers a stream's messages in
 sequence order even when they land in different rings because the player migrated between
-CPUs. If a stream's next message never arrives, the sequencer drops that stream after two
-sweeps with no progress and closes its socket.
+CPUs. If a stream's next message never arrives, the sequencer drops that stream after two sweeps
+in which nothing at all was delivered, or after it has been stuck for longer than every other
+ring could possibly take to drain while other streams delivered, and closes its socket.
 
 A player ends a stream with `try_finish`. The sequencer delivers everything up to that record,
-and closes the socket after the application has consumed it. A player whose socket closes
-without that record is treated as gone and its undelivered messages are dropped.
+and closes the socket after the application has consumed it. The player must keep its socket open
+until the sequencer closes it; `try_finish` only enqueues the end record. A player whose socket
+closes without that record is treated as gone and its undelivered messages are dropped.
 
 ## Crates
 

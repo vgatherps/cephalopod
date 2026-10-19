@@ -56,6 +56,32 @@ impl Listener {
 
     pub fn run(mut self) -> io::Result<()> {
         loop {
+            loop {
+                match self.retire.try_recv() {
+                    Ok(retire) => {
+                        let (slot, uid) = match retire {
+                            Retire::Kicked { slot, uid } | Retire::Finished { slot, uid } => {
+                                (slot, uid)
+                            }
+                        };
+                        let entry = &mut self.live[slot as usize];
+                        if entry.as_ref().is_some_and(|(live_uid, _)| *live_uid == uid) {
+                            *entry = None;
+                            self.free.push(slot);
+                            if self
+                                .control
+                                .send(Control::Close { slot, uid })
+                                .is_err()
+                            {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => return Ok(()),
+                }
+            }
+
             let mut slots = Vec::with_capacity(self.live.len());
             let mut pollfds = Vec::with_capacity(self.live.len() + 1);
             pollfds.push(libc::pollfd {
@@ -101,32 +127,6 @@ impl Listener {
                     if self.control.send(Control::Close { slot, uid }).is_err() {
                         return Ok(());
                     }
-                }
-            }
-
-            loop {
-                match self.retire.try_recv() {
-                    Ok(retire) => {
-                        let (slot, uid) = match retire {
-                            Retire::Kicked { slot, uid } | Retire::Finished { slot, uid } => {
-                                (slot, uid)
-                            }
-                        };
-                        let entry = &mut self.live[slot as usize];
-                        if entry.as_ref().is_some_and(|(live_uid, _)| *live_uid == uid) {
-                            *entry = None;
-                            self.free.push(slot);
-                            if self
-                                .control
-                                .send(Control::Close { slot, uid })
-                                .is_err()
-                            {
-                                return Ok(());
-                            }
-                        }
-                    }
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => return Ok(()),
                 }
             }
         }

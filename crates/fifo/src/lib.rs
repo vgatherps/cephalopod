@@ -54,8 +54,13 @@ struct Slot {
     uid: u32,
     expected: u64,
     live: bool,
+    stopped_since: Option<(u64, u64)>,
 }
 
+/// Records in a ring are in commit order, and a stream's sequence numbers commit in program
+/// order. Therefore the earliest committed unconsumed record is always at the front of its ring
+/// and is deliverable or discardable. This is why stopping on a ring cannot deadlock and why the
+/// global two-sweep rule never kicks a correct stream.
 pub struct Fifo {
     reader: Reader,
     slots: Vec<Slot>,
@@ -65,17 +70,25 @@ pub struct Fifo {
     stopped: bool,
     delivered: bool,
     empty_sweeps: u32,
+    sweep: u64,
+    // A missing predecessor can sit behind every ring's maximum number of 32-byte records,
+    // drained 64 per sweep. Add two sweeps per ring for stopped-ring chaining and the global rule.
+    stall_bound: u64,
     control: Receiver<Control>,
     retire: Sender<Retire>,
 }
 
 impl Fifo {
+    /// `max_streams` must equal the value passed to `Listener::bind`.
     pub fn new(
         reader: Reader,
         max_streams: u32,
         control: Receiver<Control>,
         retire: Sender<Retire>,
     ) -> Fifo {
+        let nr_rings = reader.nr_rings() as u64;
+        let stall_bound = nr_rings * (reader.ring_size() as u64 / 32 / BATCH as u64)
+            + 2 * nr_rings;
         Fifo {
             reader,
             slots: vec![Slot::default(); max_streams as usize],
@@ -85,6 +98,8 @@ impl Fifo {
             stopped: false,
             delivered: false,
             empty_sweeps: 0,
+            sweep: 0,
+            stall_bound,
             control,
             retire,
         }
@@ -93,7 +108,9 @@ impl Fifo {
     /// Returns the next deliverable message, or `None` if none is available now. The message
     /// borrows the `Fifo`; dropping it consumes the record, and `publish` happens at the next
     /// sweep boundary. Up to 64 consecutive deliveries from one ring are returned before
-    /// advancing to the next ring; discarded records do not count.
+    /// advancing to the next ring; discarded records do not count. A stalled stream is dropped
+    /// after two sweeps in which nothing at all was delivered, or after it has been stuck for
+    /// longer than every other ring could possibly take to drain while other streams delivered.
     pub fn next(&mut self) -> Option<Message<'_>> {
         loop {
             if self.pos == self.ready.len() {
@@ -132,6 +149,13 @@ impl Fifo {
                 continue;
             }
             if seq > state.expected {
+                if self.slots[index]
+                    .stopped_since
+                    .map(|(_, expected)| expected)
+                    != Some(state.expected)
+                {
+                    self.slots[index].stopped_since = Some((self.sweep, state.expected));
+                }
                 self.stopped = true;
                 self.pos += 1;
                 self.batch = 0;
@@ -139,6 +163,7 @@ impl Fifo {
             }
 
             self.slots[index].expected += 1;
+            self.slots[index].stopped_since = None;
             let finish = end.then(|| {
                 self.slots[index].live = false;
                 Retire::Finished {
@@ -176,6 +201,7 @@ impl Fifo {
     }
 
     fn start_sweep(&mut self) {
+        self.sweep += 1;
         self.drain_control();
         self.reader.publish();
         self.ready.clear();
@@ -196,16 +222,22 @@ impl Fifo {
             self.kick_first_stopped();
             self.empty_sweeps = 0;
         }
+        self.kick_first_expired_stopped();
     }
 
     fn drain_control(&mut self) {
         while let Ok(message) = self.control.try_recv() {
             match message {
                 Control::Open { slot, uid } => {
+                    assert!(
+                        (slot as usize) < self.slots.len(),
+                        "control thread's max_streams exceeds the fifo's"
+                    );
                     self.slots[slot as usize] = Slot {
                         uid,
                         expected: 0,
                         live: true,
+                        stopped_since: None,
                     };
                 }
                 Control::Close { slot, uid } => {
@@ -224,20 +256,120 @@ impl Fifo {
                 continue;
             };
             let index = slot(header.stream) as usize;
-            let Some(state) = self.slots.get_mut(index) else {
+            let Some(state) = self.slots.get(index).copied() else {
                 continue;
             };
             let stream_uid = uid(header.stream);
             let seq = header.seq & !END_OF_STREAM;
-            if state.live && state.uid == stream_uid && seq > state.expected {
-                state.live = false;
-                let _ = self.retire.send(Retire::Kicked {
-                    slot: index as u32,
-                    uid: stream_uid,
-                });
+            if state.live
+                && state.uid == stream_uid
+                && seq > state.expected
+                && state
+                    .stopped_since
+                    .is_some_and(|(since, expected)| {
+                        expected == state.expected && self.sweep - since >= 2
+                    })
+            {
+                self.kick(index, stream_uid);
                 break;
             }
         }
+    }
+
+    fn kick_first_expired_stopped(&mut self) {
+        for &ring in &self.ready {
+            let Some(header) = self.reader.front(ring) else {
+                continue;
+            };
+            let index = slot(header.stream) as usize;
+            let Some(state) = self.slots.get(index).copied() else {
+                continue;
+            };
+            let stream_uid = uid(header.stream);
+            let seq = header.seq & !END_OF_STREAM;
+            if state.live
+                && state.uid == stream_uid
+                && seq > state.expected
+                && state
+                    .stopped_since
+                    .is_some_and(|(since, expected)| {
+                        expected == state.expected && self.sweep - since > self.stall_bound
+                    })
+            {
+                self.kick(index, stream_uid);
+                break;
+            }
+        }
+    }
+
+    fn kick(&mut self, index: usize, stream_uid: u32) {
+        self.slots[index].live = false;
+        let _ = self.retire.send(Retire::Kicked {
+            slot: index as u32,
+            uid: stream_uid,
+        });
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    fn sweep_once(&mut self, between: impl FnOnce()) {
+        self.start_sweep();
+        between();
+        while self.pos != self.ready.len() {
+            let ring = self.ready[self.pos];
+            let Some(header) = self.reader.front(ring) else {
+                self.pos += 1;
+                self.batch = 0;
+                continue;
+            };
+            let index = slot(header.stream) as usize;
+            if index >= self.slots.len() {
+                self.reader.advance(ring);
+                continue;
+            }
+
+            if uid(header.stream) != self.slots[index].uid {
+                self.drain_control();
+                if uid(header.stream) != self.slots[index].uid {
+                    self.reader.advance(ring);
+                    continue;
+                }
+            }
+
+            let seq = header.seq & !END_OF_STREAM;
+            let end = header.seq & END_OF_STREAM != 0;
+            let state = self.slots[index];
+            if !state.live || seq < state.expected {
+                self.reader.advance(ring);
+                continue;
+            }
+            if seq > state.expected {
+                if self.slots[index]
+                    .stopped_since
+                    .map(|(_, expected)| expected)
+                    != Some(state.expected)
+                {
+                    self.slots[index].stopped_since = Some((self.sweep, state.expected));
+                }
+                self.stopped = true;
+                self.pos += 1;
+                self.batch = 0;
+                continue;
+            }
+
+            self.slots[index].expected += 1;
+            self.slots[index].stopped_since = None;
+            if end {
+                self.slots[index].live = false;
+                let _ = self.retire.send(Retire::Finished {
+                    slot: index as u32,
+                    uid: state.uid,
+                });
+            }
+            self.delivered = true;
+            self.reader.advance(ring);
+            self.count_record();
+        }
+        self.finish_sweep();
     }
 }
 
@@ -247,6 +379,32 @@ mod tests {
     use ceph_proto::pack;
     use ceph_ring::{Config, Writer};
     use std::sync::mpsc;
+
+    fn allowed_cpus() -> Vec<usize> {
+        // SAFETY: plain syscall into a zeroed cpu_set_t.
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            assert_eq!(
+                libc::sched_getaffinity(0, size_of::<libc::cpu_set_t>(), &mut set),
+                0
+            );
+            (0..libc::CPU_SETSIZE as usize)
+                .filter(|&cpu| libc::CPU_ISSET(cpu, &set))
+                .collect()
+        }
+    }
+
+    fn pin(cpu: usize) {
+        // SAFETY: plain syscall on the calling thread.
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            libc::CPU_SET(cpu, &mut set);
+            assert_eq!(
+                libc::sched_setaffinity(0, size_of::<libc::cpu_set_t>(), &set),
+                0
+            );
+        }
+    }
 
     #[test]
     fn empty_stopped_sweeps_do_not_kick() {
@@ -273,6 +431,7 @@ mod tests {
         assert_eq!(header.seq, 1);
         assert!(header.seq > fifo.slots[0].expected);
         fifo.stopped = true;
+        fifo.slots[0].stopped_since = Some((fifo.sweep - 1, 0));
         fifo.pos = fifo.ready.len();
         fifo.finish_sweep();
         fifo.start_sweep();
@@ -291,5 +450,52 @@ mod tests {
             retire_rx.try_recv(),
             Ok(Retire::Kicked { slot: 0, uid: 7 })
         );
+    }
+
+    #[test]
+    fn stall_history_is_per_stream() {
+        let prefix = format!("ceph-fifo-stall-history-{}", std::process::id());
+        // SAFETY: sysconf reads a process-wide constant.
+        let ring_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+        let reader = Reader::create(
+            &prefix,
+            Config {
+                ring_size,
+                max_record: 16,
+            },
+        )
+        .unwrap();
+        let writer = Writer::attach(&prefix).unwrap();
+        let (control_tx, control_rx) = mpsc::channel();
+        let (retire_tx, retire_rx) = mpsc::channel();
+        let mut fifo = Fifo::new(reader, 3, control_rx, retire_tx);
+        let cpus = allowed_cpus();
+        assert!(cpus.len() >= 2);
+        let (a, b) = (cpus[0], cpus[1]);
+        let stream_a = pack(1, 7);
+        let stream_b = pack(2, 9);
+
+        control_tx.send(Control::Open { slot: 1, uid: 7 }).unwrap();
+        control_tx.send(Control::Open { slot: 2, uid: 9 }).unwrap();
+        pin(a);
+        writer.try_push(b"a one", stream_a, 1).unwrap();
+
+        fifo.sweep_once(|| {});
+        assert_eq!(fifo.empty_sweeps, 1);
+
+        control_tx.send(Control::Close { slot: 1, uid: 7 }).unwrap();
+        pin(a);
+        writer.try_push(b"b one", stream_b, 1).unwrap();
+        fifo.sweep_once(|| {
+            pin(b);
+            writer.try_push(b"b zero", stream_b, 0).unwrap();
+        });
+        assert_eq!(retire_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+
+        fifo.sweep_once(|| {});
+        assert_eq!(fifo.slots[2].expected, 1);
+        fifo.sweep_once(|| {});
+        assert_eq!(fifo.slots[2].expected, 2);
+        assert_eq!(retire_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
     }
 }
