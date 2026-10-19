@@ -56,13 +56,8 @@ struct Slot {
     live: bool,
 }
 
-/// A stalled ring's front can only change by advancing, and every advance sets `progress`, so a
-/// kick follows a pass whose poll came after every stalled front was first seen. A correct
-/// stream's missing record was committed before the record we are stuck on, so that recheck poll
-/// shows it, in some ring that is then delivered or discarded from (progress, no kick). The only
-/// time a correct stream can be kicked is when its missing record sits behind another stream's
-/// stuck record in the same ring and that ring comes first in `stalled`; that needs a broken
-/// producer to exist already.
+/// At kick time, every ring with committed data is stalled. The victim is a front stream whose
+/// expected record is absent from every stalled ring's committed backlog.
 pub struct Fifo {
     reader: Reader,
     slots: Vec<Slot>,
@@ -70,6 +65,7 @@ pub struct Fifo {
     pos: usize,
     batch: usize,
     stalled: Vec<usize>,
+    wanted: Vec<(u64, u64, bool)>,
     progress: bool,
     control: Receiver<Control>,
     retire: Sender<Retire>,
@@ -90,6 +86,7 @@ impl Fifo {
             pos: 0,
             batch: 0,
             stalled: Vec::new(),
+            wanted: Vec::new(),
             progress: false,
             control,
             retire,
@@ -209,11 +206,44 @@ impl Fifo {
     }
 
     fn finish_sweep(&mut self) {
-        if !self.progress {
-            if let Some(&ring) = self.stalled.first() {
-                self.kick_front(ring);
+        if !self.progress && !self.stalled.is_empty() {
+            let ring = self.victim();
+            self.kick_front(ring);
+        }
+    }
+
+    /// The stalled ring whose front stream has a gap: its expected record is in no stalled ring's
+    /// backlog. Falls back to the first stalled ring when every expected record is present, which
+    /// takes a producer that committed its own records out of order.
+    fn victim(&mut self) -> usize {
+        self.wanted.clear();
+        for &ring in &self.stalled {
+            let front = self
+                .reader
+                .front(ring)
+                .unwrap_or_else(|| unreachable!("stalled ring {ring} has no committed front"));
+            self.wanted.push((
+                front.stream,
+                self.slots[slot(front.stream) as usize].expected,
+                false,
+            ));
+        }
+
+        for &ring in &self.stalled {
+            for header in self.reader.committed(ring) {
+                let seq = header.seq & !END_OF_STREAM;
+                for wanted in &mut self.wanted {
+                    if wanted.0 == header.stream && wanted.1 == seq {
+                        wanted.2 = true;
+                    }
+                }
             }
         }
+
+        self.wanted
+            .iter()
+            .position(|wanted| !wanted.2)
+            .map_or(self.stalled[0], |index| self.stalled[index])
     }
 
     fn drain_control(&mut self) {

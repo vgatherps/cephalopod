@@ -150,6 +150,39 @@ pub struct Record<'a> {
     pub payload: &'a [u8],
 }
 
+pub struct Committed<'a> {
+    reader: &'a Reader,
+    ring: usize,
+    pos: u64,
+}
+
+impl Iterator for Committed<'_> {
+    type Item = Header;
+
+    fn next(&mut self) -> Option<Header> {
+        let ring = self.ring;
+        let pos = self.pos;
+        let start = self.reader.record_start(ring, pos);
+        // SAFETY: record starts are 8-aligned and the ring is mapped twice contiguously.
+        let tag = unsafe { (&*start.add(TAG_OFFSET).cast::<AtomicU64>()).load(Acquire) };
+        if tag != tag_for(pos) {
+            return None;
+        }
+        // SAFETY: acquiring the committed tag makes the record header visible.
+        let len = unsafe { start.add(LEN_OFFSET).cast::<u64>().read() as usize };
+        assert!(
+            len <= self.reader.max_record,
+            "ring {ring}: record length {len} at {pos}"
+        );
+        // SAFETY: acquiring the committed tag makes the record header visible.
+        let stream = unsafe { start.add(STREAM_OFFSET).cast::<u64>().read() };
+        // SAFETY: acquiring the committed tag makes the record header visible.
+        let seq = unsafe { start.add(SEQ_OFFSET).cast::<u64>().read() };
+        self.pos = pos + record_total(len as u64);
+        Some(Header { stream, seq, len })
+    }
+}
+
 impl Reader {
     pub fn create(cfg: Config) -> io::Result<Reader> {
         let Config {
@@ -241,29 +274,21 @@ impl Reader {
         }
     }
 
+    /// The committed records of `ring` from its read position, front first. Each step
+    /// acquire-loads the next tag; the iterator ends at the first uncommitted position. Nothing is
+    /// consumed.
+    pub fn committed(&self, ring: usize) -> Committed<'_> {
+        Committed {
+            reader: self,
+            ring,
+            pos: self.tails[ring],
+        }
+    }
+
     /// Acquire-loads the tag at `ring`'s tail and returns a copy of the committed record's
     /// header. Nothing is consumed.
     pub fn front(&self, ring: usize) -> Option<Header> {
-        let tail = self.tails[ring];
-        let start = self.record_start(ring, tail);
-        // SAFETY: record starts are 8-aligned and the ring is mapped twice contiguously.
-        let tag = unsafe { (&*start.add(TAG_OFFSET).cast::<AtomicU64>()).load(Acquire) };
-        if tag != tag_for(tail) {
-            return None;
-        }
-        // SAFETY: acquiring the committed tag makes the record header visible.
-        let len = unsafe { start.add(LEN_OFFSET).cast::<u64>().read() as usize };
-        assert!(
-            len <= self.max_record,
-            "ring {ring}: record length {len} at {tail}"
-        );
-        Some(Header {
-            // SAFETY: acquiring the committed tag makes the record header visible.
-            stream: unsafe { start.add(STREAM_OFFSET).cast::<u64>().read() },
-            // SAFETY: acquiring the committed tag makes the record header visible.
-            seq: unsafe { start.add(SEQ_OFFSET).cast::<u64>().read() },
-            len,
-        })
+        self.committed(ring).next()
     }
 
     /// The front record's view: Acquire-loads the tag at the tail and panics if nothing is

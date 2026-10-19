@@ -74,6 +74,34 @@ fn kick_unblocks_the_ring() {
 }
 
 #[test]
+fn kick_finds_the_gap() {
+    let reader = reader(64 * KIB);
+    let s = pack(1, 7);
+    let t = pack(2, 9);
+    unsafe { reader.write_unchecked(1, t, 1, b"t one") }.unwrap();
+    unsafe { reader.write_unchecked(1, s, 0, b"s zero") }.unwrap();
+    unsafe { reader.write_unchecked(0, s, 1, b"s one") }.unwrap();
+    let (mut fifo, control, retire) = setup(reader, 8);
+    control.send(Control::Open { slot: 1, uid: 7 }).unwrap();
+    control.send(Control::Open { slot: 2, uid: 9 }).unwrap();
+
+    let mut messages = Vec::new();
+    while let Some(message) = fifo.next() {
+        messages.push((message.stream(), message.seq()));
+    }
+
+    assert_eq!(messages, vec![(s, 0), (s, 1)]);
+    assert_eq!(
+        retire.try_recv(),
+        Ok(Retire::Kicked { slot: 2, uid: 9 })
+    );
+    assert_ne!(
+        retire.try_recv(),
+        Ok(Retire::Kicked { slot: 1, uid: 7 })
+    );
+}
+
+#[test]
 fn discard_backlog_is_not_a_stall() {
     let reader = reader(64 * KIB);
     let discarded = pack(1, 7);
