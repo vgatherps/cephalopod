@@ -34,17 +34,6 @@ fn fstatfs(path: &Path) -> std::io::Result<libc::statfs> {
     Ok(unsafe { stat.assume_init() })
 }
 
-fn huge_pages_free() -> Option<usize> {
-    std::fs::read_to_string("/proc/meminfo")
-        .ok()?
-        .lines()
-        .find_map(|line| line.strip_prefix("HugePages_Free:"))?
-        .split_whitespace()
-        .next()?
-        .parse()
-        .ok()
-}
-
 fn allowed_cpu_past_first_two() -> Option<usize> {
     // SAFETY: `set` is writable storage for the affinity mask supplied to the syscall.
     unsafe {
@@ -79,21 +68,22 @@ fn huge_page_ring_wraps_and_unlinks() {
         eprintln!("skipping: /dev/hugepages is not hugetlbfs");
         return;
     }
-    let free = huge_pages_free().expect("HugePages_Free is present in /proc/meminfo");
-    if free < 20 {
-        eprintln!("skipping: only {free} huge pages are free");
-        return;
-    }
     let cpu = allowed_cpu_past_first_two()
         .expect("huge-page wrap test requires an allowed CPU numbered at least 2");
     pin(cpu);
 
-    let mut reader = Reader::create(Config {
+    let mut reader = match Reader::create(Config {
         ring_size: HUGE_PAGE,
         max_record: 4096,
         dir: dir.into(),
-    })
-    .unwrap();
+    }) {
+        Ok(reader) => reader,
+        Err(e) if e.raw_os_error() == Some(libc::ENOMEM) => {
+            eprintln!("skipping: no free huge pages");
+            return;
+        }
+        Err(e) => panic!("{e}"),
+    };
     let path = reader.name().to_owned();
     assert_eq!(fstatfs(Path::new(&path)).unwrap().f_bsize as usize, HUGE_PAGE);
     let writer = Writer::attach(&path).unwrap();

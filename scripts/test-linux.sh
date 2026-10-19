@@ -16,6 +16,12 @@ exec docker run --rm --privileged --platform "$platform" \
     -v "cephalopod-target-$tag":/w/target \
     -e CARGO_TARGET_DIR=/w/target \
     -w /w/repo \
-    rust:1.93.0-bookworm bash -c \
-    'sysctl -w vm.nr_hugepages=64 >/dev/null && mkdir -p /dev/hugepages && mount -t hugetlbfs none /dev/hugepages && cargo "$@"' \
+    rust:1.93.0-bookworm bash -c '
+        # One 2 MiB page per possible CPU plus the metadata page, released afterwards.
+        pages=$(( $(sed "s/.*[-,]//" /sys/devices/system/cpu/possible) + 3 ))
+        sysctl -w vm.nr_hugepages=$pages >/dev/null
+        mkdir -p /dev/hugepages && mount -t hugetlbfs none /dev/hugepages
+        cargo "$@"; rc=$?
+        sysctl -w vm.nr_hugepages=0 >/dev/null
+        exit $rc' \
     bash "$@"
