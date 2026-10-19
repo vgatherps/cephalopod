@@ -113,6 +113,33 @@ fn stall_kicks_the_stream() {
 }
 
 #[test]
+fn discard_backlog_is_not_a_stall() {
+    let (writer, mut fifo, control, kicks) = setup("discard-backlog");
+    let cpus = allowed_cpus();
+    assert!(cpus.len() >= 2);
+    let (a, b) = (cpus[0], cpus[1]);
+    let discarded = pack(1, 7);
+    let stream = pack(2, 9);
+    control.send(Control::Open { slot: 1, uid: 7 }).unwrap();
+    control.send(Control::Open { slot: 2, uid: 9 }).unwrap();
+
+    pin(&[b]);
+    for seq in 0..128 {
+        writer.try_push(b"discard", discarded, seq).unwrap();
+    }
+    writer.try_push(b"zero", stream, 0).unwrap();
+    pin(&[a]);
+    writer.try_push(b"one", stream, 1).unwrap();
+
+    control.send(Control::Close { slot: 1, uid: 7 }).unwrap();
+
+    assert_eq!(next_message(&mut fifo), Some((stream, 0, b"zero".to_vec())));
+    assert_eq!(next_message(&mut fifo), Some((stream, 1, b"one".to_vec())));
+    assert_eq!(next_message(&mut fifo), None);
+    assert_eq!(kicks.try_recv(), Err(TryRecvError::Empty));
+}
+
+#[test]
 fn held_message_blocks_publish() {
     let (writer, mut fifo, control, _kicks) = setup("held-message");
     let cpu = allowed_cpus()[0];

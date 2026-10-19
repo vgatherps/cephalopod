@@ -78,8 +78,8 @@ impl Fifo {
 
     /// Returns the next deliverable message, or `None` if none is available now. The message
     /// borrows the `Fifo`; dropping it consumes the record, and `publish` happens at the next
-    /// sweep boundary. Up to 64 consecutive records are passed on one ring before advancing to
-    /// the next ring.
+    /// sweep boundary. Up to 64 consecutive deliveries from one ring are returned before
+    /// advancing to the next ring; discarded records do not count.
     pub fn next(&mut self) -> Option<Message<'_>> {
         loop {
             if self.pos == self.ready.len() {
@@ -99,7 +99,6 @@ impl Fifo {
             let index = slot(header.stream) as usize;
             if index >= self.slots.len() {
                 self.reader.advance(ring);
-                self.count_record();
                 continue;
             }
 
@@ -107,7 +106,6 @@ impl Fifo {
                 self.drain_control();
                 if uid(header.stream) != self.slots[index].uid {
                     self.reader.advance(ring);
-                    self.count_record();
                     continue;
                 }
             }
@@ -115,7 +113,6 @@ impl Fifo {
             let state = self.slots[index];
             if !state.live || header.seq < state.expected {
                 self.reader.advance(ring);
-                self.count_record();
                 continue;
             }
             if header.seq > state.expected {
