@@ -23,7 +23,7 @@ fn main() {
     std::thread::spawn(move || listener.run().unwrap());
     let mut fifo = Fifo::new(reader, 1024, control_rx, retire_tx);
     loop {
-        match fifo.next() {
+        match fifo.next_message() {
             Some(message) if message.end() => println!("end"),
             Some(message) => println!(
                 "stream={} seq={} len={}",

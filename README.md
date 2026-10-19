@@ -38,7 +38,7 @@ let listener = Listener::bind(Path::new("/tmp/myqueue.sock"), reader.name(), 102
 std::thread::spawn(move || listener.run().expect("control thread failed"));
 let mut fifo = Fifo::new(reader, 1024, control_rx, retire_tx);
 loop {
-    if let Some(m) = fifo.next() {
+    if let Some(m) = fifo.next_message() {
         handle(m.stream(), m.seq(), m.payload(), m.end());
     }
 }

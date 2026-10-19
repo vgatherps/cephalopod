@@ -86,7 +86,7 @@ fn take(
     streams: &mut [Option<u64>],
     ended: &mut [bool],
 ) -> bool {
-    let Some(message) = fifo.next() else {
+    let Some(message) = fifo.next_message() else {
         return false;
     };
     if message.end() {

@@ -106,8 +106,7 @@ impl Fifo {
     /// never arrives is dropped at the end of the first pass in which nothing was delivered or
     /// discarded anywhere and a fresh poll still showed nothing for it. While other streams keep
     /// delivering, it and whatever is behind it in that ring wait.
-    #[allow(clippy::should_implement_trait)] // the message borrows self, so this cannot be an Iterator
-    pub fn next(&mut self) -> Option<Message<'_>> {
+    pub fn next_message(&mut self) -> Option<Message<'_>> {
         loop {
             if self.pos == self.ready.len() {
                 self.finish_sweep();
@@ -283,9 +282,10 @@ impl Fifo {
             .front(ring)
             .unwrap_or_else(|| unreachable!("stalled ring {ring} has no committed front"));
         let index = slot(header.stream) as usize;
-        let state = self.slots.get(index).copied().unwrap_or_else(|| {
-            unreachable!("stalled ring {ring} has out-of-range slot {index}")
-        });
+        let state =
+            self.slots.get(index).copied().unwrap_or_else(|| {
+                unreachable!("stalled ring {ring} has out-of-range slot {index}")
+            });
         let stream_uid = uid(header.stream);
         let seq = header.seq & !END_OF_STREAM;
         if !state.live || state.uid != stream_uid || seq <= state.expected {
