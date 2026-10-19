@@ -2,11 +2,11 @@
 
 FIFO messaging from many processes to one consumer over shared memory.
 
-Producers write into a queue local to the CPU they are running on, so they never contend with
-each other. The consumer reads all the per-CPU queues and delivers each producer's messages in
-order. Cost scales with the number of cores, not the number of producers.
+Each producer gets its own stream. The consumer receives every stream in order. Producers
+write to a queue local to the CPU they are on, so they never contend with each other, and the
+consumer's work grows with the number of cores, not the number of producers.
 
-## How to use it
+## Usage
 
 Producer:
 
@@ -44,36 +44,13 @@ loop {
 }
 ```
 
-`crates/fifo/examples/sequencer.rs` and `crates/fifo/examples/player.rs` are the runnable
-versions.
+`try_push` returns `Full` when the queue has no room; retry. `try_finish` ends the stream;
+`session.closed()` turns true once the consumer has handled the last message. On the consumer
+side, dropping a message consumes it.
 
-## How it works
+Runnable versions: `crates/fifo/examples/sequencer.rs` and `crates/fifo/examples/player.rs`.
 
-Each push goes into the ring of the CPU the producer is on, inside an rseq critical section,
-so one ring has one writer at a time and nothing is locked. A record is a 32-byte header
-(position tag, length, stream, sequence number) and the payload; the tag is written last and
-is the commit.
-
-The consumer sweeps the rings and hands out messages. Messages from one producer come out in
-sequence order even when the producer moved between CPUs.
-
-## Crates
-
-| Crate | |
-|---|---|
-| `ceph-rseq` | the rseq critical section that writes one record |
-| `ceph-ring` | shared-memory layout, `Reader`, `Writer` |
-| `ceph-proto` | stream ids and control messages |
-| `ceph-fifo` | `Fifo::next()`, in-order delivery |
-| `ceph-control` | hands out stream ids |
-
-## Tests
-
-```
-scripts/test-linux.sh
-```
-
-## Numbers
+## Performance
 
 M4 Pro, 14-CPU Linux VM:
 
@@ -82,3 +59,9 @@ M4 Pro, 14-CPU Linux VM:
 | push, 16-byte payload | 4.6 ns |
 | consume, per message, 8 producers | 1.6 to 1.9 ns |
 | idle sweep over 14 rings | 9.5 ns |
+
+## Tests
+
+```
+scripts/test-linux.sh
+```
