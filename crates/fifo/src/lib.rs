@@ -347,3 +347,49 @@ impl Fifo {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ceph_proto::pack;
+    use ceph_ring::Config;
+    use std::sync::mpsc;
+
+    /// A sweep's poll can see a stream's second record before its first, when the first is
+    /// committed to a ring the poll already passed. The stream is stalled in that sweep and
+    /// must get another poll before anyone decides it has a gap.
+    #[test]
+    fn a_stall_seen_this_sweep_is_not_kicked_this_sweep() {
+        let reader = Reader::create(Config {
+            ring_size: 16 * 1024,
+            max_record: 256,
+        })
+        .unwrap();
+        let (control_tx, control_rx) = mpsc::channel();
+        let (retire_tx, retire_rx) = mpsc::channel();
+        let mut fifo = Fifo::new(reader, 4, control_rx, retire_tx);
+        let stream = pack(1, 7);
+        control_tx.send(Control::Open { slot: 1, uid: 7 }).unwrap();
+
+        // SAFETY: no Writer is attached to these rings; each ring is written by this thread only.
+        unsafe { fifo.reader.write_unchecked(1, stream, 1, b"one").unwrap() };
+        fifo.start_sweep();
+        assert_eq!(fifo.ready, [1]);
+        fifo.phase = Phase::Sweeping(Sweep {
+            pos: 0,
+            batch: 0,
+            progress: false,
+        });
+        // Committed after the poll looked at ring 0.
+        // SAFETY: as above.
+        unsafe { fifo.reader.write_unchecked(0, stream, 0, b"zero").unwrap() };
+
+        let first = fifo.next_message().expect("seq 0 is deliverable after a fresh poll");
+        assert_eq!((first.stream(), first.seq()), (stream, 0));
+        drop(first);
+        let second = fifo.next_message().expect("seq 1 follows");
+        assert_eq!((second.stream(), second.seq()), (stream, 1));
+        drop(second);
+        assert!(retire_rx.try_recv().is_err(), "a correct stream was kicked");
+    }
+}
