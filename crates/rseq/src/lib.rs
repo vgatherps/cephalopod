@@ -178,6 +178,7 @@ pub enum Push {
 /// their additions must not wrap. `src` must be readable for `len` bytes and must not overlap the
 /// destination record or `private`.
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)] // mirrors the asm operand list
 pub unsafe fn push_record(
     area: ThreadArea,
     cpu: u32,
@@ -569,6 +570,7 @@ mod tests {
     /// Retries `push_record` after rseq aborts caused by preemption, which pinning does not prevent.
     ///
     /// The retry count is bounded so an implementation that aborts every attempt fails promptly.
+    #[allow(clippy::too_many_arguments)]
     unsafe fn push_retrying(
         area: ThreadArea,
         cpu: u32,
@@ -895,7 +897,7 @@ mod tests {
         record[..8].copy_from_slice(&(writer as u64).to_ne_bytes());
         record[8..16].copy_from_slice(&index.to_ne_bytes());
         for (offset, byte) in record[16..].iter_mut().enumerate() {
-            *byte = (writer as u64 * 31 ^ index * 17 ^ (offset + 16) as u64) as u8;
+            *byte = ((writer as u64 * 31) ^ (index * 17) ^ (offset + 16) as u64) as u8;
         }
     }
 
@@ -1038,10 +1040,10 @@ mod tests {
                         tails.store(tail_value, Ordering::Release);
                         continue;
                     }
-                    if active.load(Ordering::Acquire) == 0 {
-                        if tag.load(Ordering::Acquire) != tag_for(tail_value) {
-                            break;
-                        }
+                    if active.load(Ordering::Acquire) == 0
+                        && tag.load(Ordering::Acquire) != tag_for(tail_value)
+                    {
+                        break;
                     }
                     std::hint::spin_loop();
                 }

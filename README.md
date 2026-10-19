@@ -72,8 +72,7 @@ One ring per CPU. A producer pushes into the ring of the CPU it is running on, i
 critical section: if the kernel preempts or migrates it mid-push, the push is abandoned and
 retried. So each ring has exactly one writer at any instant and one reader, with no locks and
 no atomic read-modify-writes. A push is a few plain stores plus one release store of the
-record's tag, which is the commit. Producers on different CPUs never share a cache line, and
-no producer is ever blocked by another. Producer cost is flat with the producer count.
+record's tag, which is the commit.
 
 The consumer sweeps the rings from one core, reading tags to find committed records, and
 publishes its read positions once per sweep. Its per-message cost is a couple of nanoseconds;

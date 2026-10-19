@@ -151,9 +151,10 @@ impl Listener {
                 continue;
             };
             let uid = self.next_uid;
-            self.next_uid = self.next_uid.checked_add(1).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::Other, "stream uid space exhausted")
-            })?;
+            self.next_uid = self
+                .next_uid
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("stream uid space exhausted"))?;
             // Send `Open` before the reply so the player's first record cannot precede it.
             // A failed reply sends the matching `Close`.
             if self.control.send(Control::Open { slot, uid }).is_err() {

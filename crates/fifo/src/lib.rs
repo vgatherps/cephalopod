@@ -106,6 +106,7 @@ impl Fifo {
     /// never arrives is dropped at the end of the first pass in which nothing was delivered or
     /// discarded anywhere and a fresh poll still showed nothing for it. While other streams keep
     /// delivering, it and whatever is behind it in that ring wait.
+    #[allow(clippy::should_implement_trait)] // the message borrows self, so this cannot be an Iterator
     pub fn next(&mut self) -> Option<Message<'_>> {
         loop {
             if self.pos == self.ready.len() {
