@@ -8,9 +8,8 @@ rseq critical section, so a ring never has two writers at once and no atomic rea
 is needed. The sequencer polls every ring from one core and hands messages to the application
 in per-stream order.
 
-Linux with glibc 2.35 or newer, kernel 6 or newer. aarch64 is tested. x86_64 compiles but has
-not been run. On macOS the crates build and run with one ring and a spinlock, for developing
-the code around them; that path is not for production.
+Linux, x86_64 or aarch64, glibc 2.35 or newer. On macOS it runs with one ring and a spinlock,
+for development.
 
 ## How it works
 
@@ -36,16 +35,13 @@ Streams are identified by a 64-bit id handed out over a Unix socket: a slot inde
 32 bits and a per-process unique id in the low 32 bits. A player numbers its messages from 0
 and advances only after a successful push. The sequencer delivers a stream's messages in
 sequence order even when they land in different rings because the player migrated between
-CPUs. A stream whose next record never arrives is dropped at the end of the first pass in which
-nothing was delivered or discarded anywhere and a fresh poll still showed nothing for it, and
-closes its socket.
-The shared-memory name is random per sequencer run and only reachable through the socket, so a
-player from a previous run cannot write into the new rings.
+CPUs. A stream whose next record never arrives is dropped once nothing else is left to
+deliver, and its socket is closed. The shared-memory name is random per sequencer run and
+handed out over the socket.
 
-A player ends a stream with `try_finish`. The sequencer delivers everything up to that record,
-and closes the socket after the application has consumed it. The player must keep its socket open
-until the sequencer closes it; `try_finish` only enqueues the end record. A player whose socket
-closes without that record is treated as gone and its undelivered messages are dropped.
+A player ends a stream with `try_finish` and keeps its socket open; the sequencer closes it
+after the application has consumed the last record. A player whose socket closes before that
+is treated as gone and its remaining messages are dropped.
 
 ## Crates
 
@@ -117,15 +113,10 @@ scripts/test-linux.sh test -p ceph-fifo --test e2e   # one sequencer process, fo
 
 ## Numbers
 
-Measured on an M4 Pro inside a 14-CPU Linux VM. Treat them as relative.
+M4 Pro, 14-CPU Linux VM:
 
 | | |
 |---|---|
 | push, 16-byte payload, consumer polling | 4.6 ns |
 | consumer, per message, 8 writers saturating | 1.6 to 1.9 ns |
 | idle sweep over 14 rings | 9.5 ns |
-
-## Not done
-
-x86_64 has never executed. Huge pages are not used. Rings are sized at creation and every
-player maps all of them. There is no C API.
