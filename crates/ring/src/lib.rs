@@ -174,8 +174,6 @@ impl Reader {
         let nr_rings = 2;
         let generated_name = random_name()?;
         let name = shm_name(&generated_name);
-        // SAFETY: `name` is NUL-terminated. A missing object is not an error here.
-        unsafe { libc::shm_unlink(name.as_ptr()) };
         let fd = shm_open(&name, libc::O_CREAT | libc::O_EXCL)?;
         let len = meta_bytes(nr_rings) + nr_rings * ring_size;
         // SAFETY: plain syscall on an owned fd.
