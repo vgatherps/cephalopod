@@ -49,14 +49,13 @@ versions.
 
 ## How it works
 
-A producer connects over a Unix socket and gets a stream id. Each push goes into the ring of
-the CPU the producer is on, inside an rseq critical section, so one ring has one writer at a
-time and nothing is locked. A record is a 32-byte header (position tag, length, stream, sequence
-number) and the payload; the tag is written last and is the commit.
+Each push goes into the ring of the CPU the producer is on, inside an rseq critical section,
+so one ring has one writer at a time and nothing is locked. A record is a 32-byte header
+(position tag, length, stream, sequence number) and the payload; the tag is written last and
+is the commit.
 
 The consumer sweeps the rings and hands out messages. Messages from one producer come out in
-sequence order even when the producer moved between CPUs. `try_finish` ends a stream; the
-consumer closes the socket once the last message has been handled.
+sequence order even when the producer moved between CPUs.
 
 ## Crates
 
@@ -66,7 +65,7 @@ consumer closes the socket once the last message has been handled.
 | `ceph-ring` | shared-memory layout, `Reader`, `Writer` |
 | `ceph-proto` | stream ids and control messages |
 | `ceph-fifo` | `Fifo::next()`, in-order delivery |
-| `ceph-control` | the socket that hands out stream ids |
+| `ceph-control` | hands out stream ids |
 
 ## Tests
 
