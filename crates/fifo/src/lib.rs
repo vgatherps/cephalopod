@@ -363,6 +363,7 @@ mod tests {
         let reader = Reader::create(Config {
             ring_size: 16 * 1024,
             max_record: 256,
+            dir: "/dev/shm".into(),
         })
         .unwrap();
         let (control_tx, control_rx) = mpsc::channel();

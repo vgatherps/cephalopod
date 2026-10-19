@@ -43,6 +43,7 @@ mod linux {
         let mut reader = Reader::create(Config {
             ring_size: 1024 * 1024,
             max_record: 4096,
+            dir: "/dev/shm".into(),
         })
         .unwrap();
         let writer = Writer::attach(reader.name()).unwrap();

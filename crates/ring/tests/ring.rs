@@ -56,6 +56,7 @@ fn round_trip_and_wrap() {
     let mut reader = Reader::create(Config {
         ring_size: 16 * KIB,
         max_record: 300,
+        dir: "/dev/shm".into(),
     })
     .unwrap();
     let writer = Writer::attach(reader.name()).unwrap();
@@ -93,6 +94,7 @@ fn full_boundary_and_oversize() {
     let mut reader = Reader::create(Config {
         ring_size: 16 * KIB,
         max_record: max,
+        dir: "/dev/shm".into(),
     })
     .unwrap();
     let writer = Writer::attach(reader.name()).unwrap();
@@ -131,6 +133,7 @@ fn stop_before() {
     let mut reader = Reader::create(Config {
         ring_size: 16 * KIB,
         max_record: 64,
+        dir: "/dev/shm".into(),
     })
     .unwrap();
     let writer = Writer::attach(reader.name()).unwrap();
@@ -208,6 +211,7 @@ fn multi_process() {
     let mut reader = Reader::create(Config {
         ring_size: 64 * KIB,
         max_record: 256,
+        dir: "/dev/shm".into(),
     })
     .unwrap();
     let name = reader.name().to_owned();
@@ -249,6 +253,7 @@ fn stale_object() {
     let cfg = || Config {
         ring_size: 16 * KIB,
         max_record: 64,
+        dir: "/dev/shm".into(),
     };
     let cpu = allowed_cpus()[0];
     pin(&[cpu]);

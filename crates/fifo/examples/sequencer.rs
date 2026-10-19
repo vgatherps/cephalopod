@@ -8,12 +8,13 @@ use ceph_ring::{Config, Reader};
 
 fn main() {
     let args: Vec<_> = std::env::args().collect();
-    let [_, socket] = args.as_slice() else {
-        panic!("usage: sequencer <socket path>");
+    let [_, socket, dir] = args.as_slice() else {
+        panic!("usage: sequencer <socket path> <shared-file directory>");
     };
     let reader = Reader::create(Config {
-        ring_size: 1 << 20,
+        ring_size: 2 << 20,
         max_record: 4096,
+        dir: dir.into(),
     })
     .unwrap();
     let (control_tx, control_rx) = mpsc::channel();

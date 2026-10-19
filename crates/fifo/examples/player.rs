@@ -13,7 +13,7 @@ fn main() {
         panic!("usage: player <socket path> <count>");
     };
     let session = connect(Path::new(socket)).unwrap();
-    let writer = Writer::attach(&session.prefix).unwrap();
+    let writer = Writer::attach(&session.path).unwrap();
     for seq in 0..count {
         let payload = seq.to_string();
         loop {

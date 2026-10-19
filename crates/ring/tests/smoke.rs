@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use ceph_ring::{Config, Reader, Writer};
 
 fn drain(reader: &mut Reader, ring: usize) -> Vec<(u64, u64, Vec<u8>)> {
@@ -16,12 +18,18 @@ fn push_and_read_back() {
     let mut reader = Reader::create(Config {
         ring_size: 64 * 1024,
         max_record: 100,
+        dir: "/dev/shm".into(),
     })
     .unwrap();
-    assert_eq!(reader.name().len(), 19);
-    assert!(reader.name().starts_with("cph"));
+    let name = Path::new(reader.name())
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert_eq!(name.len(), 19);
+    assert!(name.starts_with("cph"));
     assert!(
-        reader.name()[3..]
+        name[3..]
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     );

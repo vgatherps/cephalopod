@@ -11,7 +11,7 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 
 pub struct Listener {
     socket: UnixListener,
-    prefix: Vec<u8>,
+    path: Vec<u8>,
     free: Vec<u32>,
     live: Vec<Option<(u32, UnixStream)>>,
     next_uid: u32,
@@ -21,31 +21,31 @@ pub struct Listener {
 
 impl Listener {
     pub fn bind(
-        path: &Path,
-        prefix: &str,
+        socket_path: &Path,
+        path: &str,
         max_streams: u32,
         control: Sender<Control>,
         retire: Receiver<Retire>,
     ) -> io::Result<Listener> {
-        let prefix = prefix.as_bytes().to_vec();
-        if u16::try_from(prefix.len()).is_err() {
+        let path = path.as_bytes().to_vec();
+        if u16::try_from(path.len()).is_err() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "shared-memory prefix exceeds u16 wire length",
+                "shared-file path exceeds u16 wire length",
             ));
         }
-        match std::fs::remove_file(path) {
+        match std::fs::remove_file(socket_path) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        let socket = UnixListener::bind(path)?;
+        let socket = UnixListener::bind(socket_path)?;
         socket.set_nonblocking(true)?;
         let free = (0..max_streams).rev().collect();
         let live = (0..max_streams).map(|_| None).collect();
         Ok(Listener {
             socket,
-            prefix,
+            path,
             free,
             live,
             next_uid: 1,
@@ -163,8 +163,8 @@ impl Listener {
             let reply = socket
                 .set_write_timeout(Some(std::time::Duration::from_millis(100)))
                 .and_then(|()| socket.write_all(&pack(slot, uid).to_le_bytes()))
-                .and_then(|()| socket.write_all(&(self.prefix.len() as u16).to_le_bytes()))
-                .and_then(|()| socket.write_all(&self.prefix));
+                .and_then(|()| socket.write_all(&(self.path.len() as u16).to_le_bytes()))
+                .and_then(|()| socket.write_all(&self.path));
             if reply.is_err() {
                 drop(socket);
                 let sent = self.control.send(Control::Close { slot, uid }).is_ok();
@@ -182,7 +182,7 @@ impl Listener {
 
 pub struct Session {
     pub stream: u64,
-    pub prefix: String,
+    pub path: String,
     socket: UnixStream,
 }
 
@@ -192,13 +192,13 @@ pub fn connect(path: &Path) -> io::Result<Session> {
     let mut length = [0_u8; 2];
     socket.read_exact(&mut stream)?;
     socket.read_exact(&mut length)?;
-    let mut prefix = vec![0_u8; u16::from_le_bytes(length) as usize];
-    socket.read_exact(&mut prefix)?;
-    let prefix = String::from_utf8(prefix)
+    let mut shared_path = vec![0_u8; u16::from_le_bytes(length) as usize];
+    socket.read_exact(&mut shared_path)?;
+    let shared_path = String::from_utf8(shared_path)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     Ok(Session {
         stream: u64::from_le_bytes(stream),
-        prefix,
+        path: shared_path,
         socket,
     })
 }

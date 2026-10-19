@@ -40,7 +40,7 @@ fn connect_opens_and_close_closes() {
 
     let first = connect(&path).unwrap();
     assert_eq!(first.stream, pack(0, 2));
-    assert_eq!(first.prefix, "ceph-test");
+    assert_eq!(first.path, "ceph-test");
     assert_eq!(
         control_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
         Control::Open { slot: 0, uid: 2 }

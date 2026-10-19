@@ -10,6 +10,7 @@ fn reader(ring_size: usize) -> Reader {
     Reader::create(Config {
         ring_size,
         max_record: 256,
+        dir: "/dev/shm".into(),
     })
     .unwrap()
 }

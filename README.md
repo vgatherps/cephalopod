@@ -12,7 +12,7 @@ Producer:
 
 ```rust
 let session = connect(Path::new("/tmp/myqueue.sock"))?;
-let writer = Writer::attach(&session.prefix)?;
+let writer = Writer::attach(&session.path)?;
 let mut seq = 0;
 for msg in messages {
     loop {
@@ -31,7 +31,11 @@ while !session.closed() {}
 Consumer:
 
 ```rust
-let reader = Reader::create(Config { ring_size: 1 << 20, max_record: 4096 })?;
+let reader = Reader::create(Config {
+    ring_size: 2 << 20,
+    max_record: 4096,
+    dir: "/dev/hugepages".into(),
+})?;
 let (control_tx, control_rx) = mpsc::channel();
 let (retire_tx, retire_rx) = mpsc::channel();
 let listener = Listener::bind(Path::new("/tmp/myqueue.sock"), reader.name(), 1024, control_tx, retire_rx)?;
@@ -76,6 +80,8 @@ critical section: if the kernel preempts or migrates it mid-push, the push is ab
 retried. So each ring has exactly one writer at any instant and one reader, with no locks and
 no atomic read-modify-writes. A push is a few plain stores plus one release store of the
 record's tag, which is the commit.
+
+Rings live in a file in a directory you choose: `/dev/shm` for normal pages, a hugetlbfs mount such as `/dev/hugepages` for 2 MiB pages.
 
 The consumer sweeps the rings from one core, reading tags to find committed records, and
 publishes its read positions once per sweep. Its per-message cost is a couple of nanoseconds;

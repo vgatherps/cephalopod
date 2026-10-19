@@ -62,7 +62,7 @@ fn run_child(spec: &str) {
     let mut cpu = index % cpus.len();
     pin(cpus[cpu]);
     let session = connect(Path::new(socket)).unwrap();
-    let writer = Writer::attach(&session.prefix).unwrap();
+    let writer = Writer::attach(&session.path).unwrap();
     let mut seq = 0;
     while seq < count {
         match writer.try_push(&pattern(index, seq), session.stream, seq) {
@@ -134,6 +134,7 @@ fn sequencer_and_players_end_to_end() {
     let reader = Reader::create(Config {
         ring_size: 64 * 1024,
         max_record: 256,
+        dir: "/dev/shm".into(),
     })
     .unwrap();
     let (control_tx, control_rx) = mpsc::channel();
