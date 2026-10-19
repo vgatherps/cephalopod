@@ -1,5 +1,6 @@
 [package]
 name = "ceph-ring"
+description = "Shared-memory ring layout, reader, and per-CPU writer"
 version.workspace = true
 edition.workspace = true
 

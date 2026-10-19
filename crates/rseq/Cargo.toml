@@ -1,5 +1,6 @@
 [package]
 name = "ceph-rseq"
+description = "Restartable-sequence record writer for per-CPU rings"
 version.workspace = true
 edition.workspace = true
 

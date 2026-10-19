@@ -1,5 +1,6 @@
 [package]
 name = "ceph-proto"
+description = "Shared stream identifiers and control-plane messages"
 version.workspace = true
 edition.workspace = true
 

@@ -1,3 +1,7 @@
+//! Shared-memory ring layout plus its single consumer and per-CPU writers.
+//!
+//! The consumer advances metadata but never writes into a ring.
+
 use std::ffi::{CString, c_int};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};

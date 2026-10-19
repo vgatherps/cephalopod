@@ -1,5 +1,6 @@
 [package]
 name = "ceph-fifo"
+description = "Sequencer-side ordering and lifecycle handling for shared-memory streams"
 version.workspace = true
 edition.workspace = true
 

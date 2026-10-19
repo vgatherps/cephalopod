@@ -1,5 +1,7 @@
 //! Definitions shared by the sequencer's polling thread (`ceph-fifo`) and its control thread
 //! (`ceph-control`).
+//!
+//! Stream ids keep the slot in the high 32 bits and the unique id in the low 32 bits.
 
 /// A stream id as carried in every record: the slot index in the high 32 bits, the unique id
 /// in the low 32 bits.

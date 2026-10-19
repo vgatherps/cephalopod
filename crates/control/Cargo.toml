@@ -1,5 +1,6 @@
 [package]
 name = "ceph-control"
+description = "Unix-socket stream allocation and player session control"
 version.workspace = true
 edition.workspace = true
 

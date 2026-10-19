@@ -1,3 +1,7 @@
+//! Record layout and the rseq critical section that writes a per-CPU ring.
+//!
+//! Absolute ring positions and their additions must never wrap.
+
 #[cfg(all(target_os = "linux", not(target_env = "gnu")))]
 compile_error!("ceph-rseq requires the GNU libc environment");
 #[cfg(all(
@@ -110,8 +114,8 @@ pub enum Push {
     /// The record does not fit below the cached tail plus the ring size. Nothing was written.
     Full,
     /// The attempt was cut short: the thread was not on `cpu`, or it was preempted, migrated, or
-    /// signalled before the tag store. The private head may be updated, and record bytes may be
-    /// written. Retry.
+    /// signalled before the tag store. The interruption point determines whether the private head
+    /// is updated and which record bytes are written. Retry.
     Aborted,
 }
 
@@ -165,9 +169,9 @@ pub enum Push {
 /// a value loaded from the consumer tail with Acquire and stored with Release. `base` must be
 /// 8-aligned and `ring_size` must be a nonzero power of two. The destination at
 /// `base + (pos & (ring_size - 1))` must be writable for [`record_total(len)`] plus eight bytes.
-/// Neither the destination record nor the cleared word after it may overlap `private`. Positions
-/// and their additions must not wrap. `src` must be readable for `len` bytes and must not overlap
-/// the destination record or `private`.
+/// The destination record and cleared word after it must not overlap `private`. Positions and
+/// their additions must not wrap. `src` must be readable for `len` bytes and must not overlap the
+/// destination record or `private`.
 #[cfg(target_os = "linux")]
 pub unsafe fn push_record(
     area: ThreadArea,

@@ -1,3 +1,7 @@
+//! Unix-socket control plane for assigning stream ids and tracking player sessions.
+//!
+//! Players send no data after the connection handshake.
+
 use ceph_proto::{Control, Retire, pack};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
@@ -88,7 +92,7 @@ impl Listener {
             for (index, slot) in slots.into_iter().enumerate() {
                 let revents = pollfds[index + 1].revents;
                 if revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
-                    // Players never send after connecting, so any readable event means the player is gone.
+                    // Players send no data after connecting. A readable event means the player is gone.
                     let (uid, socket) = self.live[slot as usize]
                         .take()
                         .expect("polled slot must still be live");
@@ -150,7 +154,8 @@ impl Listener {
             self.next_uid = self.next_uid.checked_add(1).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::Other, "stream uid space exhausted")
             })?;
-            // `Open` goes before the reply so a player's first record can never precede it; a reply failure therefore sends the matching `Close`.
+            // Send `Open` before the reply so the player's first record cannot precede it.
+            // A failed reply sends the matching `Close`.
             if self.control.send(Control::Open { slot, uid }).is_err() {
                 return Ok(false);
             }

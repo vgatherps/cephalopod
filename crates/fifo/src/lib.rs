@@ -1,3 +1,7 @@
+//! Sequencer-side ordering, stall handling, and end-of-stream delivery.
+//!
+//! Dropping a [`Message`] consumes its record.
+
 use std::sync::mpsc::{Receiver, Sender};
 
 use ceph_proto::{Control, Retire, slot, uid};
@@ -24,7 +28,7 @@ impl Message<'_> {
         self.seq
     }
 
-    /// Whether this is the stream's last record. Its payload is empty by convention.
+    /// This is the stream's last record. Its payload is empty.
     pub fn end(&self) -> bool {
         self.finish.is_some()
     }
