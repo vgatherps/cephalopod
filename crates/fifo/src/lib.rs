@@ -105,6 +105,12 @@ impl Fifo {
         }
     }
 
+    /// Tests only: the underlying reader, for writing records into rings mid-test.
+    #[cfg(feature = "test-util")]
+    pub fn reader(&self) -> &Reader {
+        &self.reader
+    }
+
     /// Returns the next deliverable message, or `None` if none is available now. The message
     /// borrows the `Fifo`; dropping it consumes the record, and `publish` happens at the next
     /// sweep boundary. Up to 64 consecutive deliveries from one ring are returned before
@@ -310,10 +316,10 @@ impl Fifo {
         });
     }
 
-    #[cfg(all(test, target_os = "linux"))]
-    fn sweep_once(&mut self, between: impl FnOnce()) {
+    #[cfg(test)]
+    fn sweep_once(&mut self, between: impl FnOnce(&Reader)) {
         self.start_sweep();
-        between();
+        between(&self.reader);
         while self.pos != self.ready.len() {
             let ring = self.ready[self.pos];
             let Some(header) = self.reader.front(ring) else {
@@ -373,58 +379,27 @@ impl Fifo {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use ceph_proto::pack;
-    use ceph_ring::{Config, Writer};
+    use ceph_ring::Config;
     use std::sync::mpsc;
-
-    fn allowed_cpus() -> Vec<usize> {
-        // SAFETY: plain syscall into a zeroed cpu_set_t.
-        unsafe {
-            let mut set: libc::cpu_set_t = std::mem::zeroed();
-            assert_eq!(
-                libc::sched_getaffinity(0, size_of::<libc::cpu_set_t>(), &mut set),
-                0
-            );
-            (0..libc::CPU_SETSIZE as usize)
-                .filter(|&cpu| libc::CPU_ISSET(cpu, &set))
-                .collect()
-        }
-    }
-
-    fn pin(cpu: usize) {
-        // SAFETY: plain syscall on the calling thread.
-        unsafe {
-            let mut set: libc::cpu_set_t = std::mem::zeroed();
-            libc::CPU_SET(cpu, &mut set);
-            assert_eq!(
-                libc::sched_setaffinity(0, size_of::<libc::cpu_set_t>(), &set),
-                0
-            );
-        }
-    }
 
     #[test]
     fn empty_stopped_sweeps_do_not_kick() {
-        let prefix = format!("ceph-fifo-unit-{}", std::process::id());
         // SAFETY: sysconf reads a process-wide constant.
         let ring_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
-        let reader = Reader::create(
-            &prefix,
-            Config {
-                ring_size,
-                max_record: 16,
-            },
-        )
+        let reader = Reader::create(Config {
+            ring_size,
+            max_record: 16,
+        })
         .unwrap();
-        let writer = Writer::attach(&prefix).unwrap();
+        unsafe { reader.write_unchecked(0, pack(0, 7), 1, b"one") }.unwrap();
         let (control_tx, control_rx) = mpsc::channel();
         let (retire_tx, retire_rx) = mpsc::channel();
         let mut fifo = Fifo::new(reader, 1, control_rx, retire_tx);
         control_tx.send(Control::Open { slot: 0, uid: 7 }).unwrap();
-        writer.try_push(b"one", pack(0, 7), 1).unwrap();
 
         fifo.start_sweep();
         let header = fifo.reader.front(fifo.ready[0]).unwrap();
@@ -454,47 +429,37 @@ mod tests {
 
     #[test]
     fn stall_history_is_per_stream() {
-        let prefix = format!("ceph-fifo-stall-history-{}", std::process::id());
         // SAFETY: sysconf reads a process-wide constant.
         let ring_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
-        let reader = Reader::create(
-            &prefix,
-            Config {
-                ring_size,
-                max_record: 16,
-            },
-        )
+        let reader = Reader::create(Config {
+            ring_size,
+            max_record: 16,
+        })
         .unwrap();
-        let writer = Writer::attach(&prefix).unwrap();
         let (control_tx, control_rx) = mpsc::channel();
         let (retire_tx, retire_rx) = mpsc::channel();
-        let mut fifo = Fifo::new(reader, 3, control_rx, retire_tx);
-        let cpus = allowed_cpus();
-        assert!(cpus.len() >= 2);
-        let (a, b) = (cpus[0], cpus[1]);
         let stream_a = pack(1, 7);
         let stream_b = pack(2, 9);
 
         control_tx.send(Control::Open { slot: 1, uid: 7 }).unwrap();
         control_tx.send(Control::Open { slot: 2, uid: 9 }).unwrap();
-        pin(a);
-        writer.try_push(b"a one", stream_a, 1).unwrap();
+        unsafe { reader.write_unchecked(0, stream_a, 1, b"a one") }.unwrap();
+        let mut fifo = Fifo::new(reader, 3, control_rx, retire_tx);
 
-        fifo.sweep_once(|| {});
+        fifo.sweep_once(|_| {});
         assert_eq!(fifo.empty_sweeps, 1);
 
         control_tx.send(Control::Close { slot: 1, uid: 7 }).unwrap();
-        pin(a);
-        writer.try_push(b"b one", stream_b, 1).unwrap();
-        fifo.sweep_once(|| {
-            pin(b);
-            writer.try_push(b"b zero", stream_b, 0).unwrap();
+        unsafe { fifo.reader().write_unchecked(0, stream_b, 1, b"b one") }
+            .unwrap();
+        fifo.sweep_once(|reader| {
+            unsafe { reader.write_unchecked(1, stream_b, 0, b"b zero") }.unwrap();
         });
         assert_eq!(retire_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
 
-        fifo.sweep_once(|| {});
+        fifo.sweep_once(|_| {});
         assert_eq!(fifo.slots[2].expected, 1);
-        fifo.sweep_once(|| {});
+        fifo.sweep_once(|_| {});
         assert_eq!(fifo.slots[2].expected, 2);
         assert_eq!(retire_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
     }

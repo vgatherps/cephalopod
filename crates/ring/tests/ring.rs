@@ -8,10 +8,6 @@ use ceph_ring::{Config, PushError, Reader, Writer};
 const KIB: usize = 1024;
 const CHILD_ENV: &str = "CEPH_RING_CHILD";
 
-fn prefix(test: &str) -> String {
-    format!("ceph-ring-{test}-{}", std::process::id())
-}
-
 fn allowed_cpus() -> Vec<usize> {
     // SAFETY: plain syscall into a zeroed cpu_set_t.
     unsafe {
@@ -57,16 +53,12 @@ fn drain(reader: &mut Reader, ring: usize) -> Vec<(u64, u64, Vec<u8>)> {
 
 #[test]
 fn round_trip_and_wrap() {
-    let p = prefix("round_trip_and_wrap");
-    let mut reader = Reader::create(
-        &p,
-        Config {
-            ring_size: 16 * KIB,
-            max_record: 300,
-        },
-    )
+    let mut reader = Reader::create(Config {
+        ring_size: 16 * KIB,
+        max_record: 300,
+    })
     .unwrap();
-    let writer = Writer::attach(&p).unwrap();
+    let writer = Writer::attach(reader.name()).unwrap();
     for &k in allowed_cpus().iter().take(2) {
         pin(&[k]);
         let (mut pushed, mut next) = (0, 0);
@@ -97,17 +89,13 @@ fn round_trip_and_wrap() {
 
 #[test]
 fn full_boundary_and_oversize() {
-    let p = prefix("full_boundary_and_oversize");
     let max = 16_344;
-    let mut reader = Reader::create(
-        &p,
-        Config {
-            ring_size: 16 * KIB,
-            max_record: max,
-        },
-    )
+    let mut reader = Reader::create(Config {
+        ring_size: 16 * KIB,
+        max_record: max,
+    })
     .unwrap();
-    let writer = Writer::attach(&p).unwrap();
+    let writer = Writer::attach(reader.name()).unwrap();
     let cpu = allowed_cpus()[0];
     pin(&[cpu]);
 
@@ -140,16 +128,12 @@ fn full_boundary_and_oversize() {
 
 #[test]
 fn stop_before() {
-    let p = prefix("stop_before");
-    let mut reader = Reader::create(
-        &p,
-        Config {
-            ring_size: 16 * KIB,
-            max_record: 64,
-        },
-    )
+    let mut reader = Reader::create(Config {
+        ring_size: 16 * KIB,
+        max_record: 64,
+    })
     .unwrap();
-    let writer = Writer::attach(&p).unwrap();
+    let writer = Writer::attach(reader.name()).unwrap();
     let cpu = allowed_cpus()[0];
     pin(&[cpu]);
     for (seq, r) in [&b"A"[..], b"BB", b"CCC"].into_iter().enumerate() {
@@ -221,21 +205,18 @@ fn multi_process() {
     }
     const CHILDREN: usize = 2;
     const COUNT: u64 = 5_000;
-    let p = prefix("multi_process");
-    let mut reader = Reader::create(
-        &p,
-        Config {
-            ring_size: 64 * KIB,
-            max_record: 256,
-        },
-    )
+    let mut reader = Reader::create(Config {
+        ring_size: 64 * KIB,
+        max_record: 256,
+    })
     .unwrap();
+    let name = reader.name().to_owned();
     let exe = std::env::current_exe().unwrap();
     let mut children: Vec<_> = (0..CHILDREN)
         .map(|id| {
             Command::new(&exe)
                 .args(["multi_process", "--exact", "--nocapture"])
-                .env(CHILD_ENV, format!("{p} {id} {COUNT}"))
+                .env(CHILD_ENV, format!("{name} {id} {COUNT}"))
                 .stdout(Stdio::null())
                 .spawn()
                 .unwrap()
@@ -265,24 +246,17 @@ fn multi_process() {
 
 #[test]
 fn stale_object() {
-    let p = prefix("stale_object");
     let cfg = || Config {
         ring_size: 16 * KIB,
         max_record: 64,
     };
     let cpu = allowed_cpus()[0];
     pin(&[cpu]);
-    let stale = Reader::create(&p, cfg()).unwrap();
-    Writer::attach(&p)
-        .unwrap()
-        .try_push(b"stale", 1, 0)
-        .unwrap();
-    std::mem::forget(stale);
+    let mut first = Reader::create(cfg()).unwrap();
+    let writer = Writer::attach(first.name()).unwrap();
+    let second = Reader::create(cfg()).unwrap();
+    assert_ne!(first.name(), second.name());
 
-    let mut reader = Reader::create(&p, cfg()).unwrap();
-    Writer::attach(&p)
-        .unwrap()
-        .try_push(b"fresh", 2, 0)
-        .unwrap();
-    assert_eq!(drain(&mut reader, cpu), [(2, 0, b"fresh".to_vec())]);
+    writer.try_push(b"first", 1, 0).unwrap();
+    assert_eq!(drain(&mut first, cpu), [(1, 0, b"first".to_vec())]);
 }

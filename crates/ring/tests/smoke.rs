@@ -13,17 +13,19 @@ fn drain(reader: &mut Reader, ring: usize) -> Vec<(u64, u64, Vec<u8>)> {
 
 #[test]
 fn push_and_read_back() {
-    // macOS limits shm names to 31 bytes including the slash.
-    let prefix = format!("cph{}", std::process::id());
-    let mut reader = Reader::create(
-        &prefix,
-        Config {
-            ring_size: 64 * 1024,
-            max_record: 100,
-        },
-    )
+    let mut reader = Reader::create(Config {
+        ring_size: 64 * 1024,
+        max_record: 100,
+    })
     .unwrap();
-    let writer = Writer::attach(&prefix).unwrap();
+    assert_eq!(reader.name().len(), 19);
+    assert!(reader.name().starts_with("cph"));
+    assert!(
+        reader.name()[3..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    );
+    let writer = Writer::attach(reader.name()).unwrap();
     let records: Vec<Vec<u8>> = (0..5u8).map(|i| vec![i; i as usize * 3]).collect();
     for (seq, r) in records.iter().enumerate() {
         writer.try_push(r, 11, seq as u64).unwrap();

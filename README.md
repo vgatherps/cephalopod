@@ -39,6 +39,8 @@ sequence order even when they land in different rings because the player migrate
 CPUs. If a stream's next message never arrives, the sequencer drops that stream after two sweeps
 in which nothing at all was delivered, or after it has been stuck for longer than every other
 ring could possibly take to drain while other streams delivered, and closes its socket.
+The shared-memory name is random per sequencer run and only reachable through the socket, so a
+player from a previous run cannot write into the new rings.
 
 A player ends a stream with `try_finish`. The sequencer delivers everything up to that record,
 and closes the socket after the application has consumed it. The player must keep its socket open
@@ -60,10 +62,16 @@ closes without that record is treated as gone and its undelivered messages are d
 Sequencer:
 
 ```rust
-let reader = Reader::create("myqueue", Config { ring_size: 1 << 20, max_record: 4096 })?;
+let reader = Reader::create(Config { ring_size: 1 << 20, max_record: 4096 })?;
 let (control_tx, control_rx) = mpsc::channel();
 let (retire_tx, retire_rx) = mpsc::channel();
-let listener = Listener::bind(Path::new("/tmp/myqueue.sock"), "myqueue", 1024, control_tx, retire_rx)?;
+let listener = Listener::bind(
+    Path::new("/tmp/myqueue.sock"),
+    reader.name(),
+    1024,
+    control_tx,
+    retire_rx,
+)?;
 std::thread::spawn(move || listener.run().expect("control thread failed"));
 let mut fifo = Fifo::new(reader, 1024, control_rx, retire_tx);
 loop {

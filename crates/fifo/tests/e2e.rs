@@ -121,15 +121,11 @@ fn sequencer_and_players_end_to_end() {
     if let Ok(spec) = std::env::var(CHILD_ENV) {
         return run_child(&spec);
     }
-    let prefix = format!("cphe2e{}", std::process::id());
     let socket = format!("/tmp/cphe2e{}.sock", std::process::id());
-    let reader = Reader::create(
-        &prefix,
-        Config {
-            ring_size: 64 * 1024,
-            max_record: 256,
-        },
-    )
+    let reader = Reader::create(Config {
+        ring_size: 64 * 1024,
+        max_record: 256,
+    })
     .unwrap();
     let (control_tx, control_rx) = mpsc::channel();
     let (retire_tx, retire_rx) = mpsc::channel();
@@ -151,7 +147,7 @@ fn sequencer_and_players_end_to_end() {
             forward_tx.send(retire).unwrap();
         }
     });
-    let listener = Listener::bind(Path::new(&socket), &prefix, 16, control_tx, forward_rx)
+    let listener = Listener::bind(Path::new(&socket), reader.name(), 16, control_tx, forward_rx)
         .unwrap();
     let listener = std::thread::spawn(move || listener.run().unwrap());
     let mut fifo = Fifo::new(reader, 16, control_rx, retire_tx);

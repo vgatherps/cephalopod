@@ -15,6 +15,7 @@ name = "ceph-fifo"
 version = "0.1.0"
 dependencies = [
  "ceph-control",
+ "ceph-fifo",
  "ceph-proto",
  "ceph-ring",
  "libc",

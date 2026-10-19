@@ -3,7 +3,9 @@
 //! The consumer advances metadata but never writes into a ring.
 
 use std::ffi::{CString, c_int};
-use std::io;
+use std::fmt::Write;
+use std::fs::File;
+use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::ptr;
 use std::slice;
@@ -149,7 +151,7 @@ pub struct Record<'a> {
 }
 
 impl Reader {
-    pub fn create(prefix: &str, cfg: Config) -> io::Result<Reader> {
+    pub fn create(cfg: Config) -> io::Result<Reader> {
         let Config {
             ring_size,
             max_record,
@@ -166,9 +168,12 @@ impl Reader {
         );
         #[cfg(target_os = "linux")]
         let nr_rings = possible_cpus()?;
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(all(not(target_os = "linux"), not(feature = "test-util")))]
         let nr_rings = 1;
-        let name = shm_name(prefix);
+        #[cfg(all(not(target_os = "linux"), feature = "test-util"))]
+        let nr_rings = 2;
+        let generated_name = random_name()?;
+        let name = shm_name(&generated_name);
         // SAFETY: `name` is NUL-terminated. A missing object is not an error here.
         unsafe { libc::shm_unlink(name.as_ptr()) };
         let fd = shm_open(&name, libc::O_CREAT | libc::O_EXCL)?;
@@ -206,6 +211,14 @@ impl Reader {
 
     pub fn nr_rings(&self) -> usize {
         self.tails.len()
+    }
+
+    pub fn name(&self) -> &str {
+        self.name
+            .to_str()
+            .expect("generated shm name is UTF-8")
+            .strip_prefix('/')
+            .expect("generated shm name starts with a slash")
     }
 
     pub fn ring_size(&self) -> usize {
@@ -316,6 +329,24 @@ impl Reader {
                 self.dirty[ring] = false;
             }
         }
+    }
+
+    /// Tests only. Writes one record directly into `ring`, bypassing rseq and the lock.
+    ///
+    /// # Safety
+    ///
+    /// No `Writer` may push into `ring` while this runs, and no two calls may run on the same
+    /// ring at once: the ring's private head and the record bytes are written without any
+    /// synchronization against other writers.
+    #[cfg(feature = "test-util")]
+    pub unsafe fn write_unchecked(
+        &self,
+        ring: usize,
+        stream: u64,
+        seq: u64,
+        payload: &[u8],
+    ) -> Result<(), PushError> {
+        write_record(&self.map, ring, self.max_record, stream, seq, payload)
     }
 
     fn record_start(&self, ring: usize, tail: u64) -> *mut u8 {
@@ -462,55 +493,69 @@ impl Writer {
                  spinlock on a single ring. Development only, NOT for production."
             )
         });
-        let ring_size = self.map.ring_size as u64;
-        let (base, private, tail) = self.map.ring(0);
         // SAFETY: `ShmHeader` starts at the beginning of the metadata mapping.
         let lock = unsafe { &(*self.map.meta.cast::<ShmHeader>()).lock };
         while lock.compare_exchange(0, 1, Acquire, Relaxed).is_err() {
             std::hint::spin_loop();
         }
-        let mask = ring_size - 1;
-        let mut at = private.head.load(Relaxed);
-        loop {
-            // SAFETY: `at` is 8-aligned and `base` is ring 0 mapped twice.
-            let start = unsafe { base.add((at & mask) as usize) };
-            // SAFETY: record tags are aligned AtomicU64 values in the shared ring.
-            let tag = unsafe { &*start.add(TAG_OFFSET).cast::<AtomicU64>() }.load(Acquire);
-            if tag != tag_for(at) {
-                break;
-            }
-            // SAFETY: acquiring the committed tag makes the record header visible.
-            let len = unsafe { start.add(LEN_OFFSET).cast::<u64>().read() };
-            at += record_total(len);
-        }
-        let total = record_total(payload.len() as u64);
-        let result = if at + total + 8 > tail.load(Acquire) + ring_size {
-            Err(PushError::Full)
-        } else {
-            private.head.store(at, Relaxed);
-            // SAFETY: create's size check keeps this record and the following tag word inside the
-            // double mapping. The consumer has released the space, and other writers hold the lock.
-            unsafe {
-                let start = base.add((at & mask) as usize);
-                (&*start.add(total as usize).cast::<AtomicU64>()).store(0, Relaxed);
-                start
-                    .add(LEN_OFFSET)
-                    .cast::<u64>()
-                    .write(payload.len() as u64);
-                start.add(STREAM_OFFSET).cast::<u64>().write(stream);
-                start.add(SEQ_OFFSET).cast::<u64>().write(seq);
-                ptr::copy_nonoverlapping(
-                    payload.as_ptr(),
-                    start.add(ceph_rseq::HEADER_LEN as usize),
-                    payload.len(),
-                );
-                (&*start.add(TAG_OFFSET).cast::<AtomicU64>()).store(tag_for(at), Release);
-            }
-            Ok(())
-        };
+        let result = write_record(&self.map, 0, self.max_record, stream, seq, payload);
         lock.store(0, Release);
         result
     }
+}
+
+#[cfg(any(not(target_os = "linux"), feature = "test-util"))]
+fn write_record(
+    map: &Map,
+    ring: usize,
+    max_record: usize,
+    stream: u64,
+    seq: u64,
+    payload: &[u8],
+) -> Result<(), PushError> {
+    if payload.len() > max_record {
+        return Err(PushError::TooLarge);
+    }
+    let ring_size = map.ring_size as u64;
+    let (base, private, tail) = map.ring(ring);
+    let mask = ring_size - 1;
+    let mut at = private.head.load(Relaxed);
+    loop {
+        // SAFETY: `at` is 8-aligned and `base` is `ring` mapped twice.
+        let start = unsafe { base.add((at & mask) as usize) };
+        // SAFETY: record tags are aligned AtomicU64 values in the shared ring.
+        let tag = unsafe { &*start.add(TAG_OFFSET).cast::<AtomicU64>() }.load(Acquire);
+        if tag != tag_for(at) {
+            break;
+        }
+        // SAFETY: acquiring the committed tag makes the record header visible.
+        let len = unsafe { start.add(LEN_OFFSET).cast::<u64>().read() };
+        at += record_total(len);
+    }
+    let total = record_total(payload.len() as u64);
+    if at + total + 8 > tail.load(Acquire) + ring_size {
+        return Err(PushError::Full);
+    }
+    private.head.store(at, Relaxed);
+    // SAFETY: create's size check keeps this record and the following tag word inside the double
+    // mapping. The consumer has released the space, and the caller excludes concurrent writers.
+    unsafe {
+        let start = base.add((at & mask) as usize);
+        (&*start.add(total as usize).cast::<AtomicU64>()).store(0, Relaxed);
+        start
+            .add(LEN_OFFSET)
+            .cast::<u64>()
+            .write(payload.len() as u64);
+        start.add(STREAM_OFFSET).cast::<u64>().write(stream);
+        start.add(SEQ_OFFSET).cast::<u64>().write(seq);
+        ptr::copy_nonoverlapping(
+            payload.as_ptr(),
+            start.add(ceph_rseq::HEADER_LEN as usize),
+            payload.len(),
+        );
+        (&*start.add(TAG_OFFSET).cast::<AtomicU64>()).store(tag_for(at), Release);
+    }
+    Ok(())
 }
 
 fn page_size() -> usize {
@@ -524,6 +569,17 @@ fn meta_bytes(nr_rings: usize) -> usize {
 
 fn private_offset(nr_rings: usize) -> usize {
     (TAILS_OFFSET + nr_rings * size_of::<AtomicU64>()).next_multiple_of(align_of::<Private>())
+}
+
+fn random_name() -> io::Result<String> {
+    let mut bytes = [0_u8; 8];
+    File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    let mut name = String::with_capacity(19);
+    name.push_str("cph");
+    for byte in bytes {
+        write!(&mut name, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    Ok(name)
 }
 
 /// Max id in the possible-CPU list, plus one.

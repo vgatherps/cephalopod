@@ -7,6 +7,9 @@ edition.workspace = true
 [lib]
 name = "ceph_ring"
 
+[features]
+test-util = []
+
 [dependencies]
 ceph-rseq.workspace = true
 libc.workspace = true

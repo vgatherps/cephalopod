@@ -12,5 +12,11 @@ ceph-proto.workspace = true
 ceph-ring.workspace = true
 
 [dev-dependencies]
+ceph-fifo = { path = ".", features = ["test-util"] }
 ceph-control.workspace = true
+ceph-ring = { workspace = true, features = ["test-util"] }
 libc.workspace = true
+
+[features]
+# Test-only hooks; enabled by this crate's own tests.
+test-util = ["ceph-ring/test-util"]
