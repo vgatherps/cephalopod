@@ -37,11 +37,33 @@ pub const fn tag_for(pos: u64) -> u64 {
 /// One CPU's private cached head and consumer tail.
 ///
 /// `head` is written by `Reader::create` once, then only inside [`push_record`] on this CPU.
-/// `tail` is read inside `push_record` and written by the caller on refresh with a Release store.
+/// `tail` is read and refreshed from the shared consumer tail inside [`push_record`].
 #[repr(C, align(128))]
 pub struct Private {
     pub head: AtomicU64,
     pub tail: AtomicU64,
+}
+
+/// One ring, as the critical section sees it. The writer keeps one per possible CPU in a
+/// contiguous table indexed by CPU number.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RingArgs {
+    pub base: *mut u8,
+    pub private: *const Private,
+    pub mask: u64,
+    pub shared_tail: *const AtomicU64,
+}
+
+const _: () = assert!(size_of::<RingArgs>() == 32);
+
+/// One record to push. The first 24 bytes are header bytes 8..32 in ring layout.
+#[repr(C)]
+pub struct RecordArgs {
+    pub len: u64,
+    pub stream: u64,
+    pub seq: u64,
+    pub src: *const u8,
 }
 
 #[cfg(target_os = "linux")]
@@ -97,7 +119,8 @@ impl ThreadArea {
         })
     }
 
-    /// Returns a volatile read of `cpu_id_start`. The result is always a valid CPU number.
+    /// Returns a volatile read of `cpu_id_start`; a negative value cast to `u32` means this thread
+    /// is not registered.
     pub fn cpu_id_start(self) -> u32 {
         // SAFETY: `ThreadArea` can only be created for the calling thread's registered area.
         unsafe { ptr::read_volatile(self.ptr.cast::<u32>()) }
@@ -110,19 +133,22 @@ impl ThreadArea {
 pub enum Push {
     /// The record is committed in the ring.
     Done,
-    /// The record does not fit below the cached tail plus the ring size. Nothing was written.
+    /// The record does not fit after refreshing the cached tail. No record bytes were written.
     Full,
-    /// The attempt was cut short: the thread was not on `cpu`, or it was preempted, migrated, or
-    /// signalled before the tag store. The interruption point determines whether the private head
-    /// is updated and which record bytes are written. Retry.
+    /// The attempt was cut short because registration failed, or the thread was preempted,
+    /// migrated, or signalled before the tag store. The interruption point determines whether the
+    /// private head is updated and which record bytes are written. Retry.
     Aborted,
 }
 
-/// Appends one record to `cpu`'s ring inside one rseq critical section.
+/// Appends one record to the current CPU's ring inside one rseq critical section.
 ///
-/// The record goes at `base + (pos & (ring_size - 1))`, where `pos` is the position after the
-/// cached-head walk. Its 32-byte header contains the position tag, payload length, stream, and
-/// sequence number, followed by `len` payload bytes and unwritten padding to a multiple of 8.
+/// `rings` is a contiguous table indexed by CPU number. `record` supplies the three header fields
+/// after the tag and the payload source. The section reads its CPU, selects the matching ring,
+/// advances past at most one committed record at the cached head, and checks room against the
+/// cached tail. Only when that check fails does it acquire the shared tail, cache it, and check
+/// once more. It then clears the following tag, writes the record, and commits with the tag store
+/// as the section's last instruction.
 ///
 /// The cached-tail check relies on ordering: the in-section plain load of `private.tail` is
 /// followed only by stores that depend on the room-check branch. Both supported architectures
@@ -139,11 +165,11 @@ pub enum Push {
 /// 3. That store is the last instruction before the start. If anything ran in between, a
 ///    preemption there would make the kernel clear `rseq_cs` (the instruction pointer is outside
 ///    the range) and the section would run unprotected.
-/// 4. The section first checks `rseq->cpu_id == cpu`, so a thread only writes the ring of the CPU
-///    it is on. It walks past every committed record at the cached head and calls the resulting
-///    position `pos`.
-/// 5. It checks that the record and the following tag word fit below the cached tail plus the ring
-///    size. It stores `pos` to the private head, then clears that following tag word.
+/// 4. The section reads `rseq->cpu_id`, aborts if it is negative, and uses it to select a
+///    [`RingArgs`]. It advances past one committed record at the cached head when present.
+/// 5. It checks that the record and following tag word fit below the cached tail plus the ring
+///    size. On failure it refreshes the cached tail from `shared_tail` with Acquire and checks once
+///    more. It stores the record position to the private head, then clears the following tag word.
 /// 6. It writes the length, stream, sequence number, and payload, then stores the position tag.
 ///    The tag store is the commit and the last instruction of the section: before it the consumer
 ///    sees no record at this position, after it the consumer sees the whole record.
@@ -157,54 +183,35 @@ pub enum Push {
 /// | 20 | the `struct rseq_cs` descriptor (in `__rseq_cs`) |
 /// | 30 | start of the critical section |
 /// | 40 | end of the critical section, right after the tag store |
-/// | 50 | cached-head walk loop |
+/// | 50 | cached-head committed-record check |
 /// | 51 | cached-head walk exit |
 /// | 52 | aarch64 payload-copy join and commit |
-/// | 53 | aarch64 32-byte copy loop and trailing overlapping copy |
-/// | 54, 55, 56, 57, 58 | aarch64 copy cases for 16-31, 8-15, 4-7, 2-3, and 0-1 bytes |
+/// | 53 | aarch64 32-byte copy loop |
+/// | 54 | aarch64 optional 16-byte remainder |
+/// | 55 | aarch64 trailing overlapping copy |
+/// | 56 | aarch64 setup for payloads of at least 16 bytes |
+/// | 59 | room is available |
 /// | 60 | abort handler: result 2, `Aborted` |
 /// | 70 | ring full: result 1, `Full` |
 /// | 90 | common exit; success leaves result 0, `Done` |
 ///
 /// # Safety
 ///
-/// `private` must point to a live, aligned `Private` for `cpu`. Its head must be a multiple of 8
-/// and must only be accessed by this function from threads running on `cpu`; its tail must contain
-/// a value loaded from the consumer tail with Acquire and stored with Release. `base` must be
-/// 8-aligned and `ring_size` must be a nonzero power of two. The destination at
-/// `base + (pos & (ring_size - 1))` must be writable for [`record_total(len)`] plus eight bytes.
-/// The destination record and cleared word after it must not overlap `private`. Positions and
-/// their additions must not wrap. `src` must be readable for `len` bytes and must not overlap the
-/// destination record or `private`.
+/// `rings` must point to a live [`RingArgs`] for every CPU number the calling thread can observe.
+/// Each `private` must be live and aligned; its head must be a multiple of 8 and only be written by
+/// this function while running on that CPU. Each `base` must be 8-aligned and double-map a ring
+/// whose nonzero power-of-two size is `mask + 1`. The destination record and following tag word
+/// must be writable and must not overlap either argument struct or private metadata. Each
+/// `shared_tail` must point to the live consumer tail for that ring. Positions and their additions
+/// must not wrap. `record` must be live and must not overlap a destination. Its `src` must not
+/// overlap a destination or private metadata and must be readable for 16 bytes when
+/// `0 < len < 16`, and for `len` bytes otherwise.
 #[cfg(target_os = "linux")]
-#[allow(clippy::too_many_arguments)] // mirrors the asm operand list
 pub unsafe fn push_record(
     area: ThreadArea,
-    cpu: u32,
-    private: *const Private,
-    base: *mut u8,
-    ring_size: u64,
-    src: *const u8,
-    len: u64,
-    stream: u64,
-    seq: u64,
+    rings: *const RingArgs,
+    record: *const RecordArgs,
 ) -> Push {
-    #[cfg(target_arch = "x86_64")]
-    #[repr(C)]
-    struct X86Args {
-        base: *mut u8,
-        ring_size: u64,
-        stream: u64,
-        seq: u64,
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    let args = X86Args {
-        base,
-        ring_size,
-        stream,
-        seq,
-    };
     let result: u64;
 
     // SAFETY: the caller provides the memory and per-CPU writer guarantees documented above.
@@ -212,8 +219,8 @@ pub unsafe fn push_record(
         // x86_64. `rep movsb` copies rcx bytes from rsi to rdi, so those three registers are fixed
         // (Rust does not allow names on fixed registers):
         //   rdi: the record address, then the destination cursor
-        //   rsi: the source cursor, starts at `src`
-        //   rcx: bytes left to copy, starts at `len`
+        //   rsi: the source cursor
+        //   rcx: bytes left to copy
         #[cfg(target_arch = "x86_64")]
         asm!(
             // Emit descriptor = { version 0, flags 0, start, length, abort handler }.
@@ -227,64 +234,67 @@ pub unsafe fn push_record(
             "leaq 20b(%rip), {desc}",
             "movq {desc}, 8({rseq})",
             "30:",
-            // Abort unless rseq->cpu_id (offset 4) is `cpu`.
-            "cmpl {cpu:e}, 4({rseq})",
-            "jne 60f",
-            // Step 1: start at the cached head.
+            // Select this CPU's 32-byte RingArgs. A negative cpu_id means registration failed.
+            "movslq 4({rseq}), {ring}",
+            "shlq $5, {ring}",
+            "js 60f",
+            "addq {rings}, {ring}",
+            "movq 8({ring}), {private}",
+            "movq 16({ring}), {mask}",
+            "movq 24({ring}), {scratch}",
+            "movq ({ring}), {base}",
+            // Start at the cached head.
             "movq ({private}), {cur}",
-            // Step 2: walk past every committed record at the cached head.
+            // A commit leaves head at that record's start, while an abort leaves it at an
+            // uncommitted start, so at most one committed record is past the cached head.
             "50:",
             "movq {cur}, %rdi",
-            "movq 8({args}), {calc}",
-            "decq {calc}",
-            "andq {calc}, %rdi",
-            "addq ({args}), %rdi",
-            "movq {cur}, {calc}",
-            "orq $1, {calc}",
+            "andq {mask}, %rdi",
+            "addq {base}, %rdi",
+            "leaq 1({cur}), {calc}",
             "cmpq {calc}, (%rdi)",
             "jne 51f",
             "movq 8(%rdi), {calc}",
-            "addq $39, {calc}",
-            "andq $-8, {calc}",
-            "addq {calc}, {cur}",
-            "jmp 50b",
+            "leaq 39({cur},{calc}), {cur}",
+            "andq $-8, {cur}",
             "51:",
-            // Step 3: full unless the record and the next tag word fit in the ring.
-            "leaq 39(%rcx), {calc}",
+            // Full unless the record and next tag word fit under the cached tail. Refresh the
+            // tail with Acquire only after that check fails, then check once more.
+            "movq ({record}), %rcx",
+            "leaq 47({cur},%rcx), {calc}",
             "andq $-8, {calc}",
-            "addq {cur}, {calc}",
-            "addq $8, {calc}",
-            "movq 8({private}), {tag_ptr}",
-            "addq 8({args}), {tag_ptr}",
-            "cmpq {tag_ptr}, {calc}",
+            "movq 8({private}), {bound}",
+            "leaq 1({bound},{mask}), {bound}",
+            "cmpq {bound}, {calc}",
+            "jbe 59f",
+            "movq ({scratch}), {bound}",
+            "movq {bound}, 8({private})",
+            "leaq 1({bound},{mask}), {bound}",
+            "cmpq {bound}, {calc}",
             "ja 70f",
-            // Step 4: cache this record's base before writing it.
+            "59:",
+            // Cache this record's base before writing it.
             "movq {cur}, ({private})",
-            // Step 5: clear the next record's tag word.
-            "subq $8, {calc}",
-            "movq 8({args}), {tag_ptr}",
-            "decq {tag_ptr}",
-            "andq {tag_ptr}, {calc}",
-            "addq ({args}), {calc}",
-            "movq $0, ({calc})",
-            // Step 6: find the record and write every header field except the tag.
+            // Clear the next record's tag word.
+            "leaq -8({calc}), %rdi",
+            "andq {mask}, %rdi",
+            "movq $0, ({base},%rdi)",
+            // Find the record and copy header bytes 8..32 from RecordArgs.
             "movq {cur}, %rdi",
-            "movq 8({args}), {calc}",
-            "decq {calc}",
-            "andq {calc}, %rdi",
-            "addq ({args}), %rdi",
-            "movq %rdi, {tag_ptr}",
-            "movq %rcx, 8(%rdi)",
-            "movq 16({args}), {calc}",
-            "movq {calc}, 16(%rdi)",
-            "movq 24({args}), {calc}",
+            "andq {mask}, %rdi",
+            "addq {base}, %rdi",
+            "movq %rdi, {scratch}",
+            "movups ({record}), {header}",
+            "movups {header}, 8(%rdi)",
+            "movq 16({record}), {calc}",
             "movq {calc}, 24(%rdi)",
             "addq $32, %rdi",
+            "movq 24({record}), %rsi",
             // The copy is interruptible and string stores stay ordered before the tag store.
             "rep movsb",
-            // Step 7: commit with the position tag; last instruction of the section.
+            // Commit with the position tag; last instruction of the section.
             "orq $1, {cur}",
-            "movq {cur}, ({tag_ptr})",
+            "movq {cur}, ({scratch})",
             "40:",
             "movq $0, {result}",
             "jmp 90f",
@@ -299,23 +309,28 @@ pub unsafe fn push_record(
             "movq $1, {result}",
             "90:",
             rseq = in(reg) area.ptr,
-            cpu = in(reg) cpu,
-            private = in(reg) private,
-            args = in(reg) &args,
-            inout("rsi") src => _,
-            inout("rcx") len => _,
+            rings = in(reg) rings,
+            record = in(reg) record,
+            out("rsi") _,
+            out("rcx") _,
             out("rdi") _,
             desc = out(reg) _,
+            ring = out(reg) _,
+            base = out(reg) _,
+            private = out(reg) _,
+            mask = out(reg) _,
             cur = out(reg) _,
             calc = out(reg) _,
-            tag_ptr = out(reg) _,
+            scratch = out(reg) _,
+            bound = out(reg) _,
+            header = out(xmm_reg) _,
             result = lateout(reg) result,
             options(att_syntax, nostack),
         );
 
         // aarch64. There is no `rep movsb`, so the copy uses overlapping loads:
         //   src, dst: source and destination cursors
-        //   left: bytes left to copy, starts at `len`
+        //   left: bytes left to copy
         //   src_end, dst_end: ends of the source and destination payloads
         //   qa, qb (NEON), ra, rb (general): values in flight
         #[cfg(target_arch = "aarch64")]
@@ -333,16 +348,20 @@ pub unsafe fn push_record(
             "add {desc}, {desc}, :lo12:20b",
             "str {desc}, [{rseq}, #8]",
             "30:",
-            // Abort unless rseq->cpu_id (offset 4) is `cpu`.
+            // Select this CPU's 32-byte RingArgs. A negative cpu_id means registration failed.
             "ldr {cpu_now:w}, [{rseq}, #4]",
-            "cmp {cpu_now:w}, {cpu:w}",
-            "b.ne 60f",
-            // Step 1: start at the cached head.
+            "tbnz {cpu_now:w}, #31, 60f",
+            "add {ring}, {rings}, {cpu_now}, lsl #5",
+            "ldp {ring_base}, {private}, [{ring}]",
+            "ldp {mask}, {shared_tail}, [{ring}, #16]",
+            "ldp {left}, {stream}, [{record}]",
+            "ldp {seq}, {src}, [{record}, #16]",
+            // Start at the cached head.
             "ldr {cur}, [{private}]",
-            // Step 2: walk past every committed record at the cached head.
+            // A commit leaves head at that record's start, while an abort leaves it at an
+            // uncommitted start, so at most one committed record is past the cached head.
             "50:",
-            "sub {calc}, {ring_size}, #1",
-            "and {dst}, {cur}, {calc}",
+            "and {dst}, {cur}, {mask}",
             "add {dst}, {ring_base}, {dst}",
             "orr {ra}, {cur}, #1",
             "ldr {rb}, [{dst}]",
@@ -352,97 +371,70 @@ pub unsafe fn push_record(
             "add {calc}, {calc}, #39",
             "and {calc}, {calc}, #-8",
             "add {cur}, {cur}, {calc}",
-            "b 50b",
             "51:",
-            // Step 3: full unless the record and the next tag word fit in the ring.
+            // Full unless the record and next tag word fit under the cached tail. Refresh the
+            // tail with Acquire only after that check fails, then check once more.
             "add {calc}, {left}, #39",
             "and {calc}, {calc}, #-8",
             "add {calc}, {cur}, {calc}",
             "add {calc}, {calc}, #8",
             "ldr {ra}, [{private}, #8]",
-            "add {ra}, {ra}, {ring_size}",
+            "add {ra}, {ra}, {mask}",
+            "add {ra}, {ra}, #1",
+            "cmp {calc}, {ra}",
+            "b.ls 59f",
+            "ldar {ra}, [{shared_tail}]",
+            "str {ra}, [{private}, #8]",
+            "add {ra}, {ra}, {mask}",
+            "add {ra}, {ra}, #1",
             "cmp {calc}, {ra}",
             "b.hi 70f",
-            // Step 4: cache this record's base before writing it.
+            "59:",
+            // Cache this record's base before writing it.
             "str {cur}, [{private}]",
-            // Step 5: clear the next record's tag word.
+            // Clear the next record's tag word.
             "sub {calc}, {calc}, #8",
-            "sub {ra}, {ring_size}, #1",
-            "and {dst}, {calc}, {ra}",
+            "and {dst}, {calc}, {mask}",
             "add {dst}, {ring_base}, {dst}",
             "str xzr, [{dst}]",
-            // Step 6: find the record and write every header field except the tag.
-            "sub {calc}, {ring_size}, #1",
-            "and {dst}, {cur}, {calc}",
+            // Find the record and copy header bytes 8..32 from RecordArgs.
+            "and {dst}, {cur}, {mask}",
             "add {dst}, {ring_base}, {dst}",
             "mov {tag_ptr}, {dst}",
-            "str {left}, [{dst}, #8]",
-            "str {stream}, [{dst}, #16]",
+            "stp {left}, {stream}, [{dst}, #8]",
             "str {seq}, [{dst}, #24]",
             "add {dst}, {dst}, #32",
+            "cbz {left}, 52f",
+            "cmp {left}, #16",
+            "b.hs 56f",
+            // Short payloads are staged in a readable 16-byte buffer. Extra stores land in the
+            // reserved padding and cleared following tag word.
+            "ldr {qa:q}, [{src}]",
+            "str {qa:q}, [{dst}]",
+            "b 52f",
+            "56:",
             "add {src_end}, {src}, {left}",
             "add {dst_end}, {dst}, {left}",
             "cmp {left}, #32",
             "b.lo 54f",
-            // Step 6: lengths of at least 32 load full remaining blocks; the trailing load ends
-            // at `src_end`, so no load passes it.
+            // Copy full 32-byte blocks.
             "53:",
             "ldp {qa:q}, {qb:q}, [{src}], #32",
             "stp {qa:q}, {qb:q}, [{dst}], #32",
             "sub {left}, {left}, #32",
             "cmp {left}, #32",
             "b.hs 53b",
-            "cbz {left}, 52f",
-            "ldp {qa:q}, {qb:q}, [{src_end}, #-32]",
-            "stp {qa:q}, {qb:q}, [{dst_end}, #-32]",
-            "b 52f",
-            // Step 6: lengths 16 through 31 load at the start and ending at `src_end`, so no
-            // load passes it.
             "54:",
             "cmp {left}, #16",
             "b.lo 55f",
-            "ldr {qa:q}, [{src}]",
-            "ldr {qb:q}, [{src_end}, #-16]",
-            "str {qa:q}, [{dst}]",
-            "str {qb:q}, [{dst_end}, #-16]",
-            "b 52f",
-            // Step 6: lengths 8 through 15 load at the start and ending at `src_end`, so no
-            // load passes it.
+            "ldr {qa:q}, [{src}], #16",
+            "str {qa:q}, [{dst}], #16",
+            "sub {left}, {left}, #16",
             "55:",
-            "cmp {left}, #8",
-            "b.lo 56f",
-            "ldr {ra}, [{src}]",
-            "ldr {rb}, [{src_end}, #-8]",
-            "str {ra}, [{dst}]",
-            "str {rb}, [{dst_end}, #-8]",
-            "b 52f",
-            // Step 6: lengths 4 through 7 load at the start and ending at `src_end`, so no load
-            // passes it.
-            "56:",
-            "cmp {left}, #4",
-            "b.lo 57f",
-            "ldr {ra:w}, [{src}]",
-            "ldr {rb:w}, [{src_end}, #-4]",
-            "str {ra:w}, [{dst}]",
-            "str {rb:w}, [{dst_end}, #-4]",
-            "b 52f",
-            // Step 6: lengths 2 and 3 load at the start and ending at `src_end`, so no load
-            // passes it.
-            "57:",
-            "cmp {left}, #2",
-            "b.lo 58f",
-            "ldrh {ra:w}, [{src}]",
-            "ldrh {rb:w}, [{src_end}, #-2]",
-            "strh {ra:w}, [{dst}]",
-            "strh {rb:w}, [{dst_end}, #-2]",
-            "b 52f",
-            // Step 6: length 1 copies one byte; length 0 copies nothing. Neither passes
-            // `src_end`. Both fall through to the commit.
-            "58:",
             "cbz {left}, 52f",
-            "ldrb {ra:w}, [{src}]",
-            "strb {ra:w}, [{dst}]",
-            // Step 7: commit. Store-release of the tag orders it after the record stores.
+            "ldr {qa:q}, [{src_end}, #-16]",
+            "str {qa:q}, [{dst_end}, #-16]",
+            // Commit. Store-release of the tag orders it after the record stores.
             "52:",
             "orr {cur}, {cur}, #1",
             "stlr {cur}, [{tag_ptr}]",
@@ -459,16 +451,19 @@ pub unsafe fn push_record(
             "mov {result}, #1",
             "90:",
             rseq = in(reg) area.ptr,
-            cpu = in(reg) cpu,
-            private = in(reg) private,
-            ring_base = in(reg) base,
-            ring_size = in(reg) ring_size,
-            stream = in(reg) stream,
-            seq = in(reg) seq,
-            src = inout(reg) src => _,
-            left = inout(reg) len => _,
+            rings = in(reg) rings,
+            record = in(reg) record,
             desc = out(reg) _,
             cpu_now = out(reg) _,
+            ring = out(reg) _,
+            private = out(reg) _,
+            ring_base = out(reg) _,
+            mask = out(reg) _,
+            shared_tail = out(reg) _,
+            stream = out(reg) _,
+            seq = out(reg) _,
+            src = out(reg) _,
+            left = out(reg) _,
             cur = out(reg) _,
             calc = out(reg) _,
             dst = out(reg) _,
@@ -551,11 +546,19 @@ mod tests {
         }
     }
 
-    fn refresh(private: &Private, tails_word: &AtomicU64) {
-        private.tail.store(
-            tails_word.load(Ordering::Acquire),
-            Ordering::Release,
-        );
+    fn ring_table(
+        base: *mut u8,
+        private: &Private,
+        ring_size: u64,
+        shared_tail: &AtomicU64,
+    ) -> Vec<RingArgs> {
+        let entry = RingArgs {
+            base,
+            private,
+            mask: ring_size - 1,
+            shared_tail,
+        };
+        vec![entry; libc::CPU_SETSIZE as usize]
     }
 
     struct SignalStopGuard<'a>(&'a AtomicBool);
@@ -569,32 +572,38 @@ mod tests {
     /// Retries `push_record` after rseq aborts caused by preemption, which pinning does not prevent.
     ///
     /// The retry count is bounded so an implementation that aborts every attempt fails promptly.
-    #[allow(clippy::too_many_arguments)]
     unsafe fn push_retrying(
         area: ThreadArea,
-        cpu: u32,
-        private: &Private,
-        buffer: &mut [u64],
-        ring_size: u64,
+        rings: &[RingArgs],
         src: &[u8],
         stream: u64,
         seq: u64,
     ) -> Push {
+        let mut small = [0_u8; 16];
+        let source = if src.len() < 16 {
+            small[..src.len()].copy_from_slice(src);
+            small.as_ptr()
+        } else {
+            src.as_ptr()
+        };
+        let record = RecordArgs {
+            len: src.len() as u64,
+            stream,
+            seq,
+            src: source,
+        };
+        // SAFETY: `source` remains live across every attempt and has the required readable span.
+        unsafe { push_retrying_record(area, rings, &record) }
+    }
+
+    unsafe fn push_retrying_record(
+        area: ThreadArea,
+        rings: &[RingArgs],
+        record: &RecordArgs,
+    ) -> Push {
         for _ in 0..10_000 {
-            // SAFETY: the caller provides storage for this record and the per-CPU private line.
-            let result = unsafe {
-                push_record(
-                    area,
-                    cpu,
-                    private,
-                    buffer.as_mut_ptr().cast(),
-                    ring_size,
-                    src.as_ptr(),
-                    src.len() as u64,
-                    stream,
-                    seq,
-                )
-            };
+            // SAFETY: the caller provides a complete CPU table and valid record storage.
+            let result = unsafe { push_record(area, rings.as_ptr(), record) };
             if result != Push::Aborted {
                 return result;
             }
@@ -605,22 +614,26 @@ mod tests {
     #[test]
     /// Walks one committed record, then tries one byte too little capacity and exact capacity.
     fn full_boundaries_do_not_write() {
-        let (area, cpu) = pinned_area();
+        let (area, _) = pinned_area();
         let payload = [0x35; 17];
         let needed = total(payload.len()) as u64;
         let head0 = RING_SIZE as u64 + 64;
         let head1 = head0 + needed;
         let mut buffer = vec![AA_WORD; (RING_SIZE + total(payload.len()) + 8) / 8];
         let private = private(head0, head0);
+        let shared_tail = AtomicU64::new(head0);
+        let rings = ring_table(
+            buffer.as_mut_ptr().cast(),
+            &private,
+            RING_SIZE as u64,
+            &shared_tail,
+        );
 
         // SAFETY: the allocation covers the record, its cleared word, and this CPU owns `private`.
         let first = unsafe {
             push_retrying(
                 area,
-                cpu,
-                &private,
-                &mut buffer,
-                RING_SIZE as u64,
+                &rings,
                 &payload,
                 7,
                 11,
@@ -631,15 +644,15 @@ mod tests {
 
         let original = buffer.clone();
         let exact_tail = head1 + needed + 8 - RING_SIZE as u64;
+        // The section refreshes from the shared tail when the cached one has no room, so both
+        // carry the same bound.
         private.tail.store(exact_tail - 1, Ordering::Release);
+        shared_tail.store(exact_tail - 1, Ordering::Release);
         // SAFETY: the full check runs before the otherwise valid destination is written.
         let short = unsafe {
             push_retrying(
                 area,
-                cpu,
-                &private,
-                &mut buffer,
-                RING_SIZE as u64,
+                &rings,
                 &payload,
                 7,
                 11,
@@ -650,14 +663,12 @@ mod tests {
         assert_eq!(buffer, original);
 
         private.tail.store(exact_tail, Ordering::Release);
+        shared_tail.store(exact_tail, Ordering::Release);
         // SAFETY: the allocation covers the fitting record, its cleared word, and this CPU owns it.
         let exact = unsafe {
             push_retrying(
                 area,
-                cpu,
-                &private,
-                &mut buffer,
-                RING_SIZE as u64,
+                &rings,
                 &payload,
                 7,
                 11,
@@ -676,45 +687,13 @@ mod tests {
     }
 
     #[test]
-    /// Supplies a CPU id different from the thread's pinned CPU for an otherwise valid record.
-    ///
-    /// It requires `Aborted` with an untouched head and buffer. This catches work done after a
-    /// failed CPU check, which should abort the critical section.
-    fn wrong_cpu_does_not_write() {
-        let (area, cpu) = pinned_area();
-        let payload = [0x71; 16];
-        let mut buffer = vec![AA_WORD; (total(payload.len()) + 8) / 8];
-        let original = buffer.clone();
-        let private = private(0, 0);
-
-        // SAFETY: the CPU check aborts before the otherwise valid destination is written.
-        let result = unsafe {
-            push_record(
-                area,
-                cpu + 1,
-                &private,
-                buffer.as_mut_ptr().cast(),
-                RING_SIZE as u64,
-                payload.as_ptr(),
-                payload.len() as u64,
-                7,
-                11,
-            )
-        };
-
-        assert_eq!(result, Push::Aborted);
-        assert_eq!(private.head.load(Ordering::Relaxed), 0);
-        assert_eq!(buffer, original);
-    }
-
-    #[test]
     /// Places payloads immediately before a protected page and copies every length through
     /// one hundred bytes.
     ///
     /// An over-read inside the section faults. The first fault enters the abort handler and the
     /// retry faults again, so the test fails, most likely by the process dying on the second fault.
     fn layout_and_no_source_over_read() {
-        let (area, cpu) = pinned_area();
+        let (area, _) = pinned_area();
         // SAFETY: the mapping is checked for failure, then split into one readable and one guard page.
         unsafe {
             let page_size = libc::sysconf(libc::_SC_PAGESIZE) as usize;
@@ -731,15 +710,30 @@ mod tests {
             assert_eq!(libc::mprotect(guard.cast(), page_size, libc::PROT_NONE), 0);
 
             for len in 0..=100 {
-                let src = guard.sub(len);
+                let readable = if (1..16).contains(&len) { 16 } else { len };
+                let src = guard.sub(readable);
+                ptr::write_bytes(src, 0, readable);
                 for index in 0..len {
                     src.add(index).write(index as u8 ^ 0xa6);
                 }
                 let mut buffer = vec![AA_WORD; RING_SIZE / 8];
                 let private = private(0, 0);
+                let shared_tail = AtomicU64::new(0);
+                let rings = ring_table(
+                    buffer.as_mut_ptr().cast(),
+                    &private,
+                    RING_SIZE as u64,
+                    &shared_tail,
+                );
                 let src = slice::from_raw_parts(src, len);
                 let stream = 0x1020_3040_5060_7080;
                 let seq = len as u64 + 0x1122;
+                let record = RecordArgs {
+                    len: len as u64,
+                    stream,
+                    seq,
+                    src: src.as_ptr(),
+                };
 
                 let check = |buffer: &[u64], pos: u64| {
                     // SAFETY: `buffer` is live, aligned, and viewed for exactly its byte length.
@@ -780,52 +774,29 @@ mod tests {
                     );
                     let payload = offset + HEADER_LEN as usize;
                     assert_eq!(&buffer[payload..payload + len], src);
-                    assert_eq!(
-                        &buffer[payload + len..offset + total(len)],
-                        vec![0xaa; total(len) - HEADER_LEN as usize - len],
-                    );
+                    if (1..16).contains(&len) {
+                        assert_eq!(&buffer[payload + len..payload + 16], vec![0; 16 - len]);
+                    } else {
+                        assert_eq!(
+                            &buffer[payload + len..offset + total(len)],
+                            vec![0xaa; total(len) - HEADER_LEN as usize - len],
+                        );
+                    }
                     assert_eq!(private.head.load(Ordering::Relaxed), pos);
                 };
 
-                let result = push_retrying(
-                    area,
-                    cpu,
-                    &private,
-                    &mut buffer,
-                    RING_SIZE as u64,
-                    src,
-                    stream,
-                    seq,
-                );
+                let result = push_retrying_record(area, &rings, &record);
                 assert_eq!(result, Push::Done);
                 check(&buffer, 0);
 
                 let second = total(len) as u64;
-                let result = push_retrying(
-                    area,
-                    cpu,
-                    &private,
-                    &mut buffer,
-                    RING_SIZE as u64,
-                    src,
-                    stream,
-                    seq,
-                );
+                let result = push_retrying_record(area, &rings, &record);
                 assert_eq!(result, Push::Done);
                 check(&buffer, second);
 
                 let empty = 4096_u64;
                 private.head.store(empty, Ordering::Relaxed);
-                let result = push_retrying(
-                    area,
-                    cpu,
-                    &private,
-                    &mut buffer,
-                    RING_SIZE as u64,
-                    src,
-                    stream,
-                    seq,
-                );
+                let result = push_retrying_record(area, &rings, &record);
                 assert_eq!(result, Push::Done);
                 check(&buffer, empty);
             }
@@ -837,38 +808,61 @@ mod tests {
     #[test]
     /// Clears a payload word that would otherwise look like a future record's tag.
     fn stale_payload_is_not_a_tag() {
-        let (area, cpu) = pinned_area();
+        let (area, _) = pinned_area();
         let mut payload = [0_u8; 32];
         payload[..8].copy_from_slice(&tag_for(96).to_ne_bytes());
         let mut buffer = vec![0_u64; (64 + total(payload.len()) + 8) / 8];
         let private = private(0, 8);
         let tails = AtomicU64::new(0);
+        let rings = ring_table(buffer.as_mut_ptr().cast(), &private, 64, &tails);
 
         // SAFETY: the allocation covers each record and cleared word, and this CPU owns `private`.
-        let first = unsafe {
-            push_retrying(area, cpu, &private, &mut buffer, 64, &payload, 7, 11)
-        };
+        let first = unsafe { push_retrying(area, &rings, &payload, 7, 11) };
         assert_eq!(first, Push::Done);
 
         tails.store(64, Ordering::Release);
-        refresh(&private, &tails);
         // SAFETY: the allocation covers each record and cleared word, and this CPU owns `private`.
-        let second = unsafe {
-            push_retrying(area, cpu, &private, &mut buffer, 64, &[], 7, 12)
-        };
+        let second = unsafe { push_retrying(area, &rings, &[], 7, 12) };
         assert_eq!(second, Push::Done);
 
         tails.store(96, Ordering::Release);
-        refresh(&private, &tails);
         assert_eq!(buffer[4], 0);
 
         // SAFETY: the allocation covers each record and cleared word, and this CPU owns `private`.
-        let third = unsafe {
-            push_retrying(area, cpu, &private, &mut buffer, 64, &[], 7, 13)
-        };
+        let third = unsafe { push_retrying(area, &rings, &[], 7, 13) };
         assert_eq!(third, Push::Done);
         assert_eq!(private.head.load(Ordering::Relaxed), 96);
         assert_eq!(buffer[4], tag_for(96));
+    }
+
+    #[test]
+    fn refresh_only_when_full() {
+        let (area, _) = pinned_area();
+        let mut buffer = vec![0_u64; RING_SIZE / 8];
+        let private = private(0, 128);
+        let shared_tail = AtomicU64::new(256);
+        let rings = ring_table(
+            buffer.as_mut_ptr().cast(),
+            &private,
+            RING_SIZE as u64,
+            &shared_tail,
+        );
+        let payload = [0x5a; 16];
+
+        // SAFETY: the table and record storage remain live and cover each attempted write.
+        assert_eq!(unsafe { push_retrying(area, &rings, &payload, 1, 0) }, Push::Done);
+        assert_eq!(private.tail.load(Ordering::Relaxed), 128);
+
+        private.head.store(RING_SIZE as u64 + 128, Ordering::Relaxed);
+        // SAFETY: the stale tail rejects this position, while the acquired shared tail admits it.
+        assert_eq!(unsafe { push_retrying(area, &rings, &payload, 1, 1) }, Push::Done);
+        assert_eq!(private.tail.load(Ordering::Relaxed), 256);
+
+        private.head.store(RING_SIZE as u64 + 256, Ordering::Relaxed);
+        shared_tail.store(256, Ordering::Release);
+        // SAFETY: the room checks return before writing the otherwise valid destination.
+        assert_eq!(unsafe { push_retrying(area, &rings, &payload, 1, 2) }, Push::Full);
+        assert_eq!(private.tail.load(Ordering::Relaxed), 256);
     }
 
     /// Accepts `SIGUSR1` so delivery can interrupt rseq without terminating the test process.
@@ -960,6 +954,7 @@ mod tests {
                     pin_to(writer_cpu);
                     let area = ThreadArea::current().expect("glibc did not register rseq");
                     assert_eq!(area.cpu_id_start(), writer_cpu as u32);
+                    let rings = ring_table(base, private, RING_SIZE as u64, tails);
                     writer_tid.send(thread_id()).unwrap();
                     start.wait();
                     let deadline = Instant::now() + Duration::from_secs(3);
@@ -970,24 +965,17 @@ mod tests {
                     while Instant::now() < deadline {
                         let len = record_len(writer_id, records);
                         fill_record(&mut record[..len], writer_id, records);
-                        // SAFETY: the allocation covers wrapped records and rseq serializes writers.
-                        let result = unsafe {
-                            push_record(
-                                area,
-                                writer_cpu as u32,
-                                private,
-                                base,
-                                RING_SIZE as u64,
-                                record.as_ptr(),
-                                len as u64,
-                                writer_id as u64,
-                                records,
-                            )
+                        let args = RecordArgs {
+                            len: len as u64,
+                            stream: writer_id as u64,
+                            seq: records,
+                            src: record.as_ptr(),
                         };
+                        // SAFETY: the allocation covers wrapped records and rseq serializes writers.
+                        let result = unsafe { push_record(area, rings.as_ptr(), &args) };
                         match result {
                             Push::Done => records += 1,
                             Push::Full => {
-                                refresh(private, tails);
                                 thread::yield_now();
                             }
                             Push::Aborted => aborts += 1,
@@ -1079,10 +1067,17 @@ mod tests {
     /// commit store immediately before `post_commit_offset`, catching a missing signature or stores
     /// outside the declared critical section.
     fn descriptor_brackets_arming_and_commit() {
-        let (area, cpu) = pinned_area();
+        let (area, _) = pinned_area();
         let payload = [0x5a; 8];
         let mut buffer = vec![AA_WORD; (RING_SIZE + total(payload.len()) + 8) / 8];
         let private = private(0, 0);
+        let shared_tail = AtomicU64::new(0);
+        let rings = ring_table(
+            buffer.as_mut_ptr().cast(),
+            &private,
+            RING_SIZE as u64,
+            &shared_tail,
+        );
         let mut descriptor_address = 0_u64;
 
         for _ in 0..10_000 {
@@ -1092,10 +1087,7 @@ mod tests {
             let result = unsafe {
                 push_retrying(
                     area,
-                    cpu,
-                    &private,
-                    &mut buffer,
-                    RING_SIZE as u64,
+                    &rings,
                     &payload,
                     7,
                     11,

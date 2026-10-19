@@ -7,16 +7,16 @@ use std::fmt::Write;
 use std::fs::File;
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::ptr;
+use std::ptr::{self, NonNull};
 use std::slice;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use std::sync::atomic::{AtomicU32, AtomicU64};
 
 use ceph_rseq::{
-    LEN_OFFSET, Private, SEQ_OFFSET, STREAM_OFFSET, TAG_OFFSET, record_total, tag_for,
+    LEN_OFFSET, Private, RingArgs, SEQ_OFFSET, STREAM_OFFSET, TAG_OFFSET, record_total, tag_for,
 };
 #[cfg(target_os = "linux")]
-use ceph_rseq::{Push, ThreadArea, push_record};
+use ceph_rseq::{Push, RecordArgs, ThreadArea, push_record};
 
 const MAGIC: u64 = u64::from_le_bytes(*b"cephring");
 const TAILS_OFFSET: usize = 4096;
@@ -54,12 +54,83 @@ pub enum PushError {
     TooLarge,
 }
 
-/// The metadata pages of one shm object, and each ring mapped twice back to back.
+struct Mapping {
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl Drop for Mapping {
+    fn drop(&mut self) {
+        // SAFETY: this is the mapping owned by `self` and nothing borrows it past `self`.
+        unsafe { libc::munmap(self.ptr.cast(), self.len) };
+    }
+}
+
+/// One ring: its double mapping and its two metadata cells.
+struct Ring {
+    base: *mut u8,
+    size: usize,
+    private: NonNull<Private>,
+    shared_tail: NonNull<AtomicU64>,
+}
+
+impl Ring {
+    fn at(&self, pos: u64) -> *mut u8 {
+        // SAFETY: `base` maps `size` bytes twice, and the mask keeps the offset in its first half.
+        unsafe { self.base.add((pos & (self.size as u64 - 1)) as usize) }
+    }
+
+    fn tag(&self, pos: u64) -> &AtomicU64 {
+        // SAFETY: record positions are 8-aligned and `at` returns storage inside the mapping.
+        unsafe { &*self.at(pos).add(TAG_OFFSET).cast::<AtomicU64>() }
+    }
+
+    fn header(&self, pos: u64, max_record: usize) -> Option<Header> {
+        if self.tag(pos).load(Acquire) != tag_for(pos) {
+            return None;
+        }
+        let start = self.at(pos);
+        // SAFETY: acquiring the committed tag makes the record header visible.
+        let len = unsafe { start.add(LEN_OFFSET).cast::<u64>().read() as usize };
+        assert!(len <= max_record, "record length {len} at {pos}");
+        // SAFETY: acquiring the committed tag makes the record header visible.
+        let stream = unsafe { start.add(STREAM_OFFSET).cast::<u64>().read() };
+        // SAFETY: acquiring the committed tag makes the record header visible.
+        let seq = unsafe { start.add(SEQ_OFFSET).cast::<u64>().read() };
+        Some(Header { stream, seq, len })
+    }
+
+    fn private(&self) -> &Private {
+        // SAFETY: `private` points into the live metadata mapping owned by the containing `Map`.
+        unsafe { self.private.as_ref() }
+    }
+
+    fn shared_tail(&self) -> &AtomicU64 {
+        // SAFETY: `shared_tail` points into the live metadata mapping owned by the containing `Map`.
+        unsafe { self.shared_tail.as_ref() }
+    }
+
+    fn args(&self) -> RingArgs {
+        RingArgs {
+            base: self.base,
+            private: self.private.as_ptr(),
+            mask: self.size as u64 - 1,
+            shared_tail: self.shared_tail.as_ptr(),
+        }
+    }
+}
+
+impl Drop for Ring {
+    fn drop(&mut self) {
+        // SAFETY: this is the double mapping owned by `self`.
+        unsafe { libc::munmap(self.base.cast(), 2 * self.size) };
+    }
+}
+
+/// The metadata pages of one shm object and its rings.
 struct Map {
-    meta: *mut u8,
-    meta_bytes: usize,
-    rings: Vec<*mut u8>,
-    ring_size: usize,
+    meta: Mapping,
+    rings: Vec<Ring>,
 }
 
 impl Map {
@@ -67,13 +138,14 @@ impl Map {
         let fd = fd.as_raw_fd();
         let rw = libc::PROT_READ | libc::PROT_WRITE;
         let meta_bytes = meta_bytes(nr_rings);
-        // SAFETY: no address hint, so the kernel picks unused address space.
-        let meta = unsafe { mmap(ptr::null_mut(), meta_bytes, rw, libc::MAP_SHARED, fd, 0)? };
+        let meta = Mapping {
+            // SAFETY: no address hint, so the kernel picks unused address space.
+            ptr: unsafe { mmap(ptr::null_mut(), meta_bytes, rw, libc::MAP_SHARED, fd, 0)? },
+            len: meta_bytes,
+        };
         let mut map = Map {
             meta,
-            meta_bytes,
             rings: Vec::with_capacity(nr_rings),
-            ring_size,
         };
         for i in 0..nr_rings {
             let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
@@ -88,7 +160,22 @@ impl Map {
                     0,
                 )?
             };
-            map.rings.push(ring);
+            let tail = map.meta.ptr.wrapping_add(TAILS_OFFSET).cast::<AtomicU64>();
+            let private = map
+                .meta
+                .ptr
+                .wrapping_add(private_offset(nr_rings))
+                .cast::<Private>();
+            // SAFETY: this cell is inside the non-null metadata mapping for index `i`.
+            let private = unsafe { NonNull::new_unchecked(private.add(i)) };
+            // SAFETY: this cell is inside the non-null metadata mapping for index `i`.
+            let shared_tail = unsafe { NonNull::new_unchecked(tail.add(i)) };
+            map.rings.push(Ring {
+                base: ring,
+                size: ring_size,
+                private,
+                shared_tail,
+            });
             let offset = meta_bytes + i * ring_size;
             for half in [ring, ring.wrapping_add(ring_size)] {
                 // SAFETY: `half` is one half of the reservation just made and owned by `map`.
@@ -106,33 +193,11 @@ impl Map {
         }
         Ok(map)
     }
-
-    /// Ring `i`'s base address, private line, and consumer tail. Panics if `i` is not a ring.
-    fn ring(&self, i: usize) -> (*mut u8, &Private, &AtomicU64) {
-        let base = self.rings[i];
-        // SAFETY: the compact tails and aligned private lines are inside the metadata mapping.
-        let tail = unsafe { &*self.meta.add(TAILS_OFFSET).cast::<AtomicU64>().add(i) };
-        let private = unsafe {
-            &*self
-                .meta
-                .add(private_offset(self.rings.len()))
-                .cast::<Private>()
-                .add(i)
-        };
-        (base, private, tail)
-    }
 }
 
-impl Drop for Map {
-    fn drop(&mut self) {
-        // SAFETY: these are the mappings made in `Map::new`; nothing borrows them past `self`.
-        unsafe {
-            for &ring in &self.rings {
-                libc::munmap(ring.cast(), 2 * self.ring_size);
-            }
-            libc::munmap(self.meta.cast(), self.meta_bytes);
-        }
-    }
+struct Cursor {
+    tail: u64,
+    dirty: bool,
 }
 
 /// Owns the shm object: unmaps and `shm_unlink`s it on drop.
@@ -140,9 +205,11 @@ pub struct Reader {
     map: Map,
     name: CString,
     max_record: usize,
-    tails: Vec<u64>,
-    dirty: Vec<bool>,
+    cursors: Vec<Cursor>,
 }
+
+// SAFETY: `Reader` owns its mappings and cursor state; moving it transfers the sole consumer.
+unsafe impl Send for Reader {}
 
 pub struct Record<'a> {
     pub stream: u64,
@@ -151,35 +218,19 @@ pub struct Record<'a> {
 }
 
 pub struct Committed<'a> {
-    reader: &'a Reader,
-    ring: usize,
+    ring: &'a Ring,
     pos: u64,
+    max_record: usize,
 }
 
 impl Iterator for Committed<'_> {
     type Item = Header;
 
     fn next(&mut self) -> Option<Header> {
-        let ring = self.ring;
         let pos = self.pos;
-        let start = self.reader.record_start(ring, pos);
-        // SAFETY: record starts are 8-aligned and the ring is mapped twice contiguously.
-        let tag = unsafe { (&*start.add(TAG_OFFSET).cast::<AtomicU64>()).load(Acquire) };
-        if tag != tag_for(pos) {
-            return None;
-        }
-        // SAFETY: acquiring the committed tag makes the record header visible.
-        let len = unsafe { start.add(LEN_OFFSET).cast::<u64>().read() as usize };
-        assert!(
-            len <= self.reader.max_record,
-            "ring {ring}: record length {len} at {pos}"
-        );
-        // SAFETY: acquiring the committed tag makes the record header visible.
-        let stream = unsafe { start.add(STREAM_OFFSET).cast::<u64>().read() };
-        // SAFETY: acquiring the committed tag makes the record header visible.
-        let seq = unsafe { start.add(SEQ_OFFSET).cast::<u64>().read() };
-        self.pos = pos + record_total(len as u64);
-        Some(Header { stream, seq, len })
+        let header = self.ring.header(pos, self.max_record)?;
+        self.pos = pos + record_total(header.len as u64);
+        Some(header)
     }
 }
 
@@ -213,15 +264,18 @@ impl Reader {
             return Err(io::Error::last_os_error());
         }
         let map = Map::new(&fd, nr_rings, ring_size)?;
-        let mut tails = Vec::with_capacity(nr_rings);
+        let mut cursors = Vec::with_capacity(nr_rings);
         for k in 0..nr_rings {
             let position = k as u64 * STAGGER;
-            let (_, private, shared_tail) = map.ring(k);
-            private.head.store(position, Relaxed);
-            shared_tail.store(position, Relaxed);
-            tails.push(position);
+            let ring = &map.rings[k];
+            ring.private().head.store(position, Relaxed);
+            ring.shared_tail().store(position, Relaxed);
+            cursors.push(Cursor {
+                tail: position,
+                dirty: false,
+            });
         }
-        let header = map.meta.cast::<ShmHeader>();
+        let header = map.meta.ptr.cast::<ShmHeader>();
         // SAFETY: the header is in the mapping; writers read the other fields only after seeing
         // `magic`.
         unsafe {
@@ -234,13 +288,12 @@ impl Reader {
             map,
             name,
             max_record,
-            tails,
-            dirty: vec![false; nr_rings],
+            cursors,
         })
     }
 
     pub fn nr_rings(&self) -> usize {
-        self.tails.len()
+        self.cursors.len()
     }
 
     pub fn name(&self) -> &str {
@@ -255,19 +308,9 @@ impl Reader {
     /// is only a hint: `front` and `view` perform the Acquire load required before consuming a
     /// record.
     pub fn poll(&self, out: &mut Vec<usize>) {
-        let mask = self.map.ring_size as u64 - 1;
         for ring in 0..self.nr_rings() {
-            let tail = self.tails[ring];
-            let (base, _, _) = self.map.ring(ring);
-            // SAFETY: record starts are 8-aligned and the ring is mapped twice contiguously.
-            let tag = unsafe {
-                (&*base
-                    .add((tail & mask) as usize)
-                    .add(TAG_OFFSET)
-                    .cast::<AtomicU64>())
-                    .load(Relaxed)
-            };
-            if tag == tag_for(tail) {
+            let tail = self.cursors[ring].tail;
+            if self.map.rings[ring].tag(tail).load(Relaxed) == tag_for(tail) {
                 out.push(ring);
             }
         }
@@ -278,9 +321,9 @@ impl Reader {
     /// consumed.
     pub fn committed(&self, ring: usize) -> Committed<'_> {
         Committed {
-            reader: self,
-            ring,
-            pos: self.tails[ring],
+            ring: &self.map.rings[ring],
+            pos: self.cursors[ring].tail,
+            max_record: self.max_record,
         }
     }
 
@@ -293,28 +336,21 @@ impl Reader {
     /// The front record's view: Acquire-loads the tag at the tail and panics if nothing is
     /// committed there. Nothing is consumed.
     pub fn view(&self, ring: usize) -> Record<'_> {
-        let tail = self.tails[ring];
-        let start = self.record_start(ring, tail);
-        // SAFETY: record starts are 8-aligned and the ring is mapped twice contiguously.
-        let tag = unsafe { (&*start.add(TAG_OFFSET).cast::<AtomicU64>()).load(Acquire) };
-        assert_eq!(tag, tag_for(tail), "ring {ring}: no record at {tail}");
-        // SAFETY: acquiring the committed tag makes the record header visible.
-        let len = unsafe { start.add(LEN_OFFSET).cast::<u64>().read() as usize };
-        assert!(
-            len <= self.max_record,
-            "ring {ring}: record length {len} at {tail}"
-        );
-        // SAFETY: acquiring the committed tag makes the record header visible.
-        let stream = unsafe { start.add(STREAM_OFFSET).cast::<u64>().read() };
-        // SAFETY: acquiring the committed tag makes the record header visible.
-        let seq = unsafe { start.add(SEQ_OFFSET).cast::<u64>().read() };
+        let tail = self.cursors[ring].tail;
+        let ring_map = &self.map.rings[ring];
+        let header = ring_map
+            .header(tail, self.max_record)
+            .unwrap_or_else(|| panic!("ring {ring}: no record at {tail}"));
         Record {
-            stream,
-            seq,
+            stream: header.stream,
+            seq: header.seq,
             // SAFETY: the length was validated, the ring is double-mapped, and no tail moves
             // while the returned record borrows the reader.
             payload: unsafe {
-                slice::from_raw_parts(start.add(ceph_rseq::HEADER_LEN as usize), len)
+                slice::from_raw_parts(
+                    ring_map.at(tail).add(ceph_rseq::HEADER_LEN as usize),
+                    header.len,
+                )
             },
         }
     }
@@ -323,28 +359,24 @@ impl Reader {
     /// advances the local tail by its total, and marks the ring for `publish`. Shared memory is
     /// not touched.
     pub fn advance(&mut self, ring: usize) {
-        let tail = self.tails[ring];
-        let start = self.record_start(ring, tail);
-        // SAFETY: record starts are 8-aligned and the ring is mapped twice contiguously.
-        let tag = unsafe { (&*start.add(TAG_OFFSET).cast::<AtomicU64>()).load(Acquire) };
-        assert_eq!(tag, tag_for(tail), "ring {ring}: no record at {tail}");
-        // SAFETY: acquiring the committed tag makes the record length visible.
-        let len = unsafe { start.add(LEN_OFFSET).cast::<u64>().read() as usize };
-        assert!(
-            len <= self.max_record,
-            "ring {ring}: record length {len} at {tail}"
-        );
-        self.tails[ring] = tail + record_total(len as u64);
-        self.dirty[ring] = true;
+        let cursor = &mut self.cursors[ring];
+        let tail = cursor.tail;
+        let header = self.map.rings[ring]
+            .header(tail, self.max_record)
+            .unwrap_or_else(|| panic!("ring {ring}: no record at {tail}"));
+        cursor.tail = tail + record_total(header.len as u64);
+        cursor.dirty = true;
     }
 
     /// Release-stores every local tail that moved since the previous publish.
     pub fn publish(&mut self) {
         for ring in 0..self.nr_rings() {
-            if self.dirty[ring] {
-                let (_, _, shared_tail) = self.map.ring(ring);
-                shared_tail.store(self.tails[ring], Release);
-                self.dirty[ring] = false;
+            let cursor = &mut self.cursors[ring];
+            if cursor.dirty {
+                self.map.rings[ring]
+                    .shared_tail()
+                    .store(cursor.tail, Release);
+                cursor.dirty = false;
             }
         }
     }
@@ -364,14 +396,7 @@ impl Reader {
         seq: u64,
         payload: &[u8],
     ) -> Result<(), PushError> {
-        write_record(&self.map, ring, self.max_record, stream, seq, payload)
-    }
-
-    fn record_start(&self, ring: usize, tail: u64) -> *mut u8 {
-        let (base, _, _) = self.map.ring(ring);
-        let mask = self.map.ring_size as u64 - 1;
-        // The ring is mapped twice, so a record can cross its physical end contiguously.
-        unsafe { base.add((tail & mask) as usize) }
+        write_record(&self.map.rings[ring], self.max_record, stream, seq, payload)
     }
 }
 
@@ -383,7 +408,10 @@ impl Drop for Reader {
 }
 
 pub struct Writer {
+    #[allow(dead_code)] // keeps the mappings referenced by `table` alive
     map: Map,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    table: Vec<RingArgs>,
     max_record: usize,
 }
 
@@ -438,8 +466,11 @@ impl Writer {
             libc::munmap(header.cast(), page);
             fields
         };
+        let map = Map::new(&fd, nr_rings, ring_size)?;
+        let table = map.rings.iter().map(Ring::args).collect();
         Ok(Writer {
-            map: Map::new(&fd, nr_rings, ring_size)?,
+            map,
+            table,
             max_record,
         })
     }
@@ -459,43 +490,30 @@ impl Writer {
 
     #[cfg(target_os = "linux")]
     fn push(&self, payload: &[u8], stream: u64, seq: u64) -> Result<(), PushError> {
-        let ring_size = self.map.ring_size as u64;
-        let mut refreshed = None;
         let area = ThreadArea::current().expect("attach checked that rseq is registered");
         if (area.cpu_id_start() as i32) < 0 {
             panic!("rseq is not registered for this thread");
         }
+        let mut small = [0_u8; 16];
+        let src = if payload.len() < 16 {
+            small[..payload.len()].copy_from_slice(payload);
+            small.as_ptr()
+        } else {
+            payload.as_ptr()
+        };
+        let record = RecordArgs {
+            len: payload.len() as u64,
+            stream,
+            seq,
+            src,
+        };
         loop {
-            let cpu = area.cpu_id_start();
-            // `nr_rings` is the number of possible CPUs, so every `cpu_id` indexes in range.
-            let (base, private, tail) = self.map.ring(cpu as usize);
-            // SAFETY: `private` is CPU `cpu`'s aligned private line, `base` is its double-mapped
-            // ring, and create's size check keeps the record plus its following tag word inside
-            // the mapping.
-            let push = unsafe {
-                push_record(
-                    area,
-                    cpu,
-                    private,
-                    base,
-                    ring_size,
-                    payload.as_ptr(),
-                    payload.len() as u64,
-                    stream,
-                    seq,
-                )
-            };
-            match push {
+            // SAFETY: `table` has one live entry per possible CPU, the source has the required
+            // readable span, and create's size check reserves the record and following tag word.
+            match unsafe { push_record(area, self.table.as_ptr(), &record) } {
                 Push::Done => return Ok(()),
-                Push::Aborted => refreshed = None,
-                Push::Full => {
-                    if refreshed == Some(cpu) {
-                        return Err(PushError::Full);
-                    }
-                    // Use the same CPU for both accesses; migration can only cause another refresh.
-                    private.tail.store(tail.load(Acquire), Release);
-                    refreshed = Some(cpu);
-                }
+                Push::Full => return Err(PushError::Full),
+                Push::Aborted => {}
             }
         }
     }
@@ -512,11 +530,11 @@ impl Writer {
             )
         });
         // SAFETY: `ShmHeader` starts at the beginning of the metadata mapping.
-        let lock = unsafe { &(*self.map.meta.cast::<ShmHeader>()).lock };
+        let lock = unsafe { &(*self.map.meta.ptr.cast::<ShmHeader>()).lock };
         while lock.compare_exchange(0, 1, Acquire, Relaxed).is_err() {
             std::hint::spin_loop();
         }
-        let result = write_record(&self.map, 0, self.max_record, stream, seq, payload);
+        let result = write_record(&self.map.rings[0], self.max_record, stream, seq, payload);
         lock.store(0, Release);
         result
     }
@@ -524,8 +542,7 @@ impl Writer {
 
 #[cfg(any(not(target_os = "linux"), feature = "test-util"))]
 fn write_record(
-    map: &Map,
-    ring: usize,
+    ring: &Ring,
     max_record: usize,
     stream: u64,
     seq: u64,
@@ -534,31 +551,21 @@ fn write_record(
     if payload.len() > max_record {
         return Err(PushError::TooLarge);
     }
-    let ring_size = map.ring_size as u64;
-    let (base, private, tail) = map.ring(ring);
-    let mask = ring_size - 1;
+    let ring_size = ring.size as u64;
+    let private = ring.private();
     let mut at = private.head.load(Relaxed);
-    loop {
-        // SAFETY: `at` is 8-aligned and `base` is `ring` mapped twice.
-        let start = unsafe { base.add((at & mask) as usize) };
-        // SAFETY: record tags are aligned AtomicU64 values in the shared ring.
-        let tag = unsafe { &*start.add(TAG_OFFSET).cast::<AtomicU64>() }.load(Acquire);
-        if tag != tag_for(at) {
-            break;
-        }
-        // SAFETY: acquiring the committed tag makes the record header visible.
-        let len = unsafe { start.add(LEN_OFFSET).cast::<u64>().read() };
-        at += record_total(len);
+    while let Some(header) = ring.header(at, max_record) {
+        at += record_total(header.len as u64);
     }
     let total = record_total(payload.len() as u64);
-    if at + total + 8 > tail.load(Acquire) + ring_size {
+    if at + total + 8 > ring.shared_tail().load(Acquire) + ring_size {
         return Err(PushError::Full);
     }
     private.head.store(at, Relaxed);
     // SAFETY: create's size check keeps this record and the following tag word inside the double
     // mapping. The consumer has released the space, and the caller excludes concurrent writers.
     unsafe {
-        let start = base.add((at & mask) as usize);
+        let start = ring.at(at);
         (&*start.add(total as usize).cast::<AtomicU64>()).store(0, Relaxed);
         start
             .add(LEN_OFFSET)
