@@ -11,4 +11,5 @@ ceph-proto.workspace = true
 ceph-ring.workspace = true
 
 [dev-dependencies]
+ceph-control.workspace = true
 libc.workspace = true

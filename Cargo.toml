@@ -11,3 +11,4 @@ libc = "0.2"
 ceph-rseq = { path = "crates/rseq" }
 ceph-ring = { path = "crates/ring" }
 ceph-proto = { path = "crates/proto" }
+ceph-control = { path = "crates/control" }
