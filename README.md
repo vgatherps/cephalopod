@@ -62,7 +62,7 @@ let reader = Reader::create("myqueue", Config { ring_size: 1 << 20, max_record: 
 let (control_tx, control_rx) = mpsc::channel();
 let (retire_tx, retire_rx) = mpsc::channel();
 let listener = Listener::bind(Path::new("/tmp/myqueue.sock"), "myqueue", 1024, control_tx, retire_rx)?;
-std::thread::spawn(move || listener.run());
+std::thread::spawn(move || listener.run().expect("control thread failed"));
 let mut fifo = Fifo::new(reader, 1024, control_rx, retire_tx);
 loop {
     if let Some(m) = fifo.next() {
@@ -78,10 +78,16 @@ let session = connect(Path::new("/tmp/myqueue.sock"))?;
 let writer = Writer::attach(&session.prefix)?;
 let mut seq = 0;
 for msg in messages {
-    while writer.try_push(msg, session.stream, seq) == Err(PushError::Full) {}
-    seq += 1;
+    loop {
+        match writer.try_push(msg, session.stream, seq) {
+            Ok(()) => break,
+            Err(PushError::Full) => std::hint::spin_loop(),
+            Err(PushError::TooLarge) => panic!("message larger than max_record"),
+        }
+    }
+    seq += 1;   // only after a successful push
 }
-while writer.try_finish(session.stream, seq) == Err(PushError::Full) {}
+while writer.try_finish(session.stream, seq) == Err(PushError::Full) {}   // an empty record cannot be too large
 while !session.closed() {}   // the sequencer closes the socket once everything is consumed
 ```
 

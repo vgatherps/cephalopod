@@ -413,7 +413,8 @@ impl Writer {
             // `nr_rings` is the number of possible CPUs, so every `cpu_id` indexes in range.
             let (base, private, tail) = self.map.ring(cpu as usize);
             // SAFETY: `private` is CPU `cpu`'s aligned private line, `base` is its double-mapped
-            // ring, and create ensures the record plus its following tag word fit in the mapping.
+            // ring, and create's size check keeps the record plus its following tag word inside
+            // the mapping.
             let push = unsafe {
                 push_record(
                     area,
@@ -479,8 +480,8 @@ impl Writer {
             Err(PushError::Full)
         } else {
             private.head.store(at, Relaxed);
-            // SAFETY: create ensures this record and the following tag word fit in the double
-            // mapping. The consumer has released the space, and other writers hold the lock.
+            // SAFETY: create's size check keeps this record and the following tag word inside the
+            // double mapping. The consumer has released the space, and other writers hold the lock.
             unsafe {
                 let start = base.add((at & mask) as usize);
                 (&*start.add(total as usize).cast::<AtomicU64>()).store(0, Relaxed);
