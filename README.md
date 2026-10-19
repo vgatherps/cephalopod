@@ -1,15 +1,12 @@
 # cephalopod
 
-A shared-memory queue for one sequencer process receiving messages from many player
-processes on the same Linux machine.
+A shared-memory queue. One sequencer process receives messages from many player processes on
+the same Linux machine.
 
-Each CPU has one ring. A player writes into the ring of the CPU it is running on, inside an
-rseq critical section, so a ring never has two writers at once and no atomic read-modify-write
-is needed. The sequencer polls every ring from one core and hands messages to the application
-in per-stream order.
-
-Linux, x86_64 or aarch64, glibc 2.35 or newer. On macOS it runs with one ring and a spinlock,
-for development.
+There is one ring per CPU. A player writes into the ring of the CPU it is running on, inside
+an rseq critical section. That is what keeps two writers out of the same ring without any
+atomic read-modify-write. The sequencer polls every ring from one core and hands messages to
+the application in per-stream order.
 
 ## How it works
 
@@ -23,23 +20,24 @@ A message is a 32-byte header and a payload:
 | 24 | sequence number |
 | 32 | payload, padded to 8 bytes |
 
-The tag is written last, with release ordering. That store is the commit. Before writing a
-record the producer zeroes the tag word of the next record position, so a record start always
-holds either a real tag or 0. There is no shared head word; the consumer finds the end of
-committed data by reading tags.
+The tag is written last, with release ordering, and that store is the commit. Before writing a
+record the producer zeroes the tag word at the next record position, so a record start always
+holds a real tag or 0. There is no shared head word. The consumer finds the end of committed
+data by reading tags.
 
-Each CPU has a private cache line holding its ring's write position and a copy of the
-consumer's read position. The consumer publishes read positions once per sweep.
+Each CPU has a private cache line with its ring's write position and a copy of the consumer's
+read position. The consumer publishes read positions once per sweep.
 
-Streams are identified by a 64-bit id handed out over a Unix socket: a slot index in the high
-32 bits and a per-process unique id in the low 32 bits. A player numbers its messages from 0
-and advances only after a successful push. The sequencer delivers a stream's messages in
-sequence order even when they land in different rings because the player migrated between
-CPUs. A stream whose next record never arrives is dropped once nothing else is left to
-deliver, and its socket is closed. The shared-memory name is random per sequencer run and
-handed out over the socket.
+A stream id is a 64-bit number handed out over a Unix socket: a slot index in the high 32 bits,
+a per-process unique id in the low 32 bits. A player numbers its messages from 0 and advances
+only after a successful push. A player can migrate between CPUs; its messages then land in
+different rings, and the sequencer still delivers them in sequence order.
 
-A player ends a stream with `try_finish` and keeps its socket open; the sequencer closes it
+A stream whose next record never arrives is dropped once nothing else is left to deliver, and
+its socket is closed. The shared-memory name is random per sequencer run and handed out over
+the socket.
+
+A player ends a stream with `try_finish` and keeps its socket open. The sequencer closes it
 after the application has consumed the last record. A player whose socket closes before that
 is treated as gone and its remaining messages are dropped.
 
