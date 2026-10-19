@@ -63,7 +63,10 @@ M4 Pro, 14-CPU Linux VM:
 ## Tests
 
 ```
-scripts/test-linux.sh
+make test        # in Docker
+make e2e
+make bench
+make clippy
 ```
 
 ## How it works
